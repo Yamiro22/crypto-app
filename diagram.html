@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>BabyDoge BTC Oracle v3 — Architecture</title>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Share+Tech+Mono&family=Nunito:wght@600;700;800;900&display=swap" rel="stylesheet"/>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:      #03030f;
+    --bg2:     #07071a;
+    --bg3:     #0a0a22;
+    --border:  #12122e;
+    --orange:  #ff6d00;
+    --orange2: #ff9d00;
+    --green:   #00e5aa;
+    --blue:    #00c8ff;
+    --purple:  #c44dff;
+    --red:     #ff3366;
+    --yellow:  #ffd700;
+    --text:    #e0e0ff;
+    --muted:   #3a3a6a;
+    --dim:     #1a1a40;
+  }
+  html, body { width: 100%; min-height: 100vh; background: var(--bg); color: var(--text); font-family: 'Nunito', sans-serif; overflow-x: hidden; }
+
+  /* ── Background grid ── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; z-index: 0;
+    background-image:
+      linear-gradient(rgba(255,109,0,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,109,0,.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+  }
+
+  .page { position: relative; z-index: 1; padding: 32px 24px 60px; max-width: 1300px; margin: 0 auto; }
+
+  /* ── Header ── */
+  .header { text-align: center; margin-bottom: 40px; }
+  .header-tag { font-family: 'Share Tech Mono', monospace; font-size: 11px; color: var(--orange); letter-spacing: 3px; margin-bottom: 8px; opacity: .7; }
+  .header h1 { font-family: 'Fredoka One', sans-serif; font-size: clamp(22px, 4vw, 36px); color: var(--orange); line-height: 1; margin-bottom: 6px; text-shadow: 0 0 30px rgba(255,109,0,.4); }
+  .header p { font-size: 13px; color: var(--muted); font-weight: 700; }
+
+  /* ── Section labels ── */
+  .layer-label {
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 9px; letter-spacing: 3px; font-weight: 700;
+    color: var(--dim); text-transform: uppercase;
+    margin-bottom: 10px; padding-left: 4px;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px 16px;
+    position: relative;
+    cursor: pointer;
+    transition: transform .2s, box-shadow .2s, border-color .2s;
+  }
+  .card:hover { transform: translateY(-3px); }
+  .card.active { border-color: var(--orange) !important; box-shadow: 0 0 20px rgba(255,109,0,.2); }
+
+  .card-icon { font-size: 20px; margin-bottom: 6px; }
+  .card-title { font-family: 'Fredoka One', sans-serif; font-size: 13px; line-height: 1.2; margin-bottom: 4px; }
+  .card-sub { font-size: 9px; color: var(--muted); font-weight: 700; letter-spacing: .5px; }
+  .card-badge {
+    position: absolute; top: 10px; right: 10px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 8px; padding: 2px 7px; border-radius: 20px; font-weight: 700;
+  }
+
+  /* ── Color variants ── */
+  .c-orange  { color: var(--orange);  border-color: #ff6d0033; }
+  .c-orange:hover  { border-color: var(--orange); box-shadow: 0 0 16px rgba(255,109,0,.15); }
+  .c-green   { color: var(--green);   border-color: #00e5aa22; }
+  .c-green:hover   { border-color: var(--green);  box-shadow: 0 0 16px rgba(0,229,170,.15); }
+  .c-blue    { color: var(--blue);    border-color: #00c8ff22; }
+  .c-blue:hover    { border-color: var(--blue);   box-shadow: 0 0 16px rgba(0,200,255,.15); }
+  .c-purple  { color: var(--purple);  border-color: #c44dff22; }
+  .c-purple:hover  { border-color: var(--purple); box-shadow: 0 0 16px rgba(196,77,255,.15); }
+  .c-yellow  { color: var(--yellow);  border-color: #ffd70022; }
+  .c-yellow:hover  { border-color: var(--yellow); box-shadow: 0 0 16px rgba(255,215,0,.15); }
+  .c-red     { color: var(--red);     border-color: #ff336622; }
+  .c-red:hover     { border-color: var(--red);    box-shadow: 0 0 16px rgba(255,51,102,.15); }
+
+  /* ── Flow arrows ── */
+  .flow-row {
+    display: flex; align-items: center; gap: 0;
+    margin: 6px 0;
+  }
+  .arrow {
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 11px; padding: 0 6px;
+    font-family: 'Share Tech Mono', monospace;
+  }
+  .arrow-down {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 16px; margin: 4px 0;
+    width: 100%; text-align: center;
+  }
+
+  /* ── Layouts ── */
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .grid-6 { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+  @media (max-width: 900px) {
+    .grid-3 { grid-template-columns: repeat(2, 1fr); }
+    .grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .grid-6 { grid-template-columns: repeat(3, 1fr); }
+  }
+  @media (max-width: 600px) {
+    .grid-3, .grid-4, .grid-6 { grid-template-columns: 1fr 1fr; }
+  }
+
+  /* ── Section wrapper ── */
+  .section {
+    background: rgba(10,10,30,.6);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    margin-bottom: 16px;
+    position: relative;
+  }
+  .section-head {
+    display: flex; align-items: center; gap: 10px;
+    margin-bottom: 14px;
+  }
+  .section-icon { font-size: 18px; }
+  .section-title { font-family: 'Fredoka One', sans-serif; font-size: 15px; }
+  .section-desc { font-size: 10px; color: var(--muted); font-weight: 700; margin-left: auto; text-align: right; max-width: 260px; line-height: 1.5; }
+
+  /* ── Big central arrow ── */
+  .big-arrow {
+    text-align: center; padding: 8px 0;
+    font-size: 22px; color: var(--dim);
+    position: relative;
+  }
+  .big-arrow::before, .big-arrow::after {
+    content: '';
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 1px; height: 28px;
+    background: linear-gradient(to bottom, transparent, var(--dim), transparent);
+  }
+
+  /* ── Detail panel ── */
+  .detail-panel {
+    background: var(--bg3);
+    border: 1px solid var(--orange);
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-top: 20px;
+    min-height: 100px;
+    transition: all .3s;
+    box-shadow: 0 0 30px rgba(255,109,0,.1);
+  }
+  .detail-title { font-family: 'Fredoka One', sans-serif; font-size: 16px; color: var(--orange); margin-bottom: 8px; }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 10px; }
+  .detail-item { background: var(--bg2); border-radius: 8px; padding: 10px 12px; }
+  .detail-item-label { font-size: 8px; letter-spacing: 1.5px; font-weight: 800; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }
+  .detail-item-val { font-size: 11px; color: var(--text); font-weight: 700; line-height: 1.5; }
+
+  /* ── Data flow connector ── */
+  .connector-row {
+    display: flex; align-items: stretch; gap: 0;
+    margin: 12px 0;
+  }
+  .connector-line {
+    width: 2px;
+    background: linear-gradient(to bottom, var(--orange), var(--purple));
+    border-radius: 2px;
+    margin: 0 20px;
+    flex-shrink: 0;
+  }
+
+  /* ── Legend ── */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 8px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; font-size: 10px; font-weight: 800; color: var(--muted); }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+  /* ── Pipe tags ── */
+  .pipe {
+    display: inline-block;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 8px; padding: 2px 6px;
+    border-radius: 4px; font-weight: 700;
+    border: 1px solid currentColor;
+    opacity: .8;
+    margin: 2px;
+  }
+
+  /* ── Animations ── */
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.4 } }
+  @keyframes slideIn { from { opacity:0; transform:translateY(10px) } to { opacity:1; transform:translateY(0) } }
+  .pulse { animation: pulse 2s ease-in-out infinite; }
+  .slide-in { animation: slideIn .35s ease; }
+
+  /* ── Flow diagram specific ── */
+  .flow-container { position: relative; }
+  .flow-step {
+    display: flex; align-items: flex-start; gap: 14px;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .flow-step:last-child { border-bottom: none; }
+  .step-num {
+    width: 24px; height: 24px; border-radius: 50%;
+    background: var(--orange); color: #050510;
+    font-family: 'Fredoka One', sans-serif; font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; margin-top: 1px;
+  }
+  .step-content { flex: 1; }
+  .step-title { font-family: 'Fredoka One', sans-serif; font-size: 13px; color: var(--text); margin-bottom: 3px; }
+  .step-desc { font-size: 10px; color: var(--muted); font-weight: 700; line-height: 1.6; }
+
+  /* Tab nav */
+  .tab-nav { display: flex; gap: 4px; margin-bottom: 20px; background: var(--bg2); padding: 4px; border-radius: 10px; border: 1px solid var(--border); }
+  .tab-btn {
+    flex: 1; padding: 8px 10px; border: none; border-radius: 7px; cursor: pointer;
+    font-family: 'Fredoka One', sans-serif; font-size: 11px; letter-spacing: .3px;
+    background: transparent; color: var(--muted); transition: all .2s;
+  }
+  .tab-btn.on { background: var(--bg3); color: var(--orange); box-shadow: 0 0 12px rgba(255,109,0,.15); }
+
+  .view { display: none; }
+  .view.on { display: block; animation: slideIn .3s ease; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="header">
+    <div class="header-tag">SYSTEM ARCHITECTURE • v3</div>
+    <h1>🐾 BabyDoge BTC Oracle</h1>
+    <p>Click any block to learn what it does · 3 views available below</p>
+  </div>
+
+  <!-- TAB NAV -->
+  <div class="tab-nav">
+    <button class="tab-btn on" onclick="showTab('overview')">🗺 Overview</button>
+    <button class="tab-btn" onclick="showTab('dataflow')">⚡ Data Flow</button>
+    <button class="tab-btn" onclick="showTab('botflow')">🤖 Bot Round</button>
+  </div>
+
+  <!-- ══════════════════════ OVERVIEW TAB ══════════════════════ -->
+  <div id="view-overview" class="view on">
+
+    <!-- LAYER 1: External Data Sources -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">🌐</span>
+        <span class="section-title" style="color:var(--blue)">Layer 1 — External Data Sources</span>
+        <span class="section-desc">Raw data coming into the app from the internet.<br>All routed through Vite proxy to avoid CORS.</span>
+      </div>
+      <div class="grid-3">
+        <div class="card c-orange" onclick="showDetail('binance-ws')">
+          <div class="card-badge" style="background:rgba(0,229,170,.15);color:var(--green)">LIVE</div>
+          <div class="card-icon">📡</div>
+          <div class="card-title">Binance WebSocket</div>
+          <div class="card-sub">stream.binance.com:9443<br>btcusdt@trade + miniTicker</div>
+        </div>
+        <div class="card c-orange" onclick="showDetail('binance-rest')">
+          <div class="card-badge" style="background:rgba(255,109,0,.15);color:var(--orange)">REST</div>
+          <div class="card-icon">📊</div>
+          <div class="card-title">Binance REST API</div>
+          <div class="card-sub">api.binance.com/api/v3<br>klines · ticker · price</div>
+        </div>
+        <div class="card c-purple" onclick="showDetail('polymarket')">
+          <div class="card-badge" style="background:rgba(196,77,255,.15);color:var(--purple)">MARKET</div>
+          <div class="card-icon">🎯</div>
+          <div class="card-title">Polymarket APIs</div>
+          <div class="card-sub">Gamma · CLOB · Data API<br>odds · spread · history</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="big-arrow">↓</div>
+
+    <!-- LAYER 2: Service Layer -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">⚙️</span>
+        <span class="section-title" style="color:var(--orange)">Layer 2 — Service Layer <span style="font-family:'Share Tech Mono';font-size:10px;color:var(--muted)">src/services/</span></span>
+        <span class="section-desc">Fetches raw data, parses it,<br>returns clean structured objects to the app.</span>
+      </div>
+      <div class="grid-4">
+        <div class="card c-green" onclick="showDetail('binanceWS-svc')">
+          <div class="card-icon">🔌</div>
+          <div class="card-title">binanceWS.js</div>
+          <div class="card-sub">WebSocket manager<br>auto-reconnect · listeners</div>
+        </div>
+        <div class="card c-green" onclick="showDetail('binanceApi-svc')">
+          <div class="card-icon">📈</div>
+          <div class="card-title">binanceApi.js</div>
+          <div class="card-sub">Klines → OHLCV arrays<br>All 6 timeframes parallel</div>
+        </div>
+        <div class="card c-purple" onclick="showDetail('polyApi-svc')">
+          <div class="card-icon">🎯</div>
+          <div class="card-title">polymarketApi.js</div>
+          <div class="card-sub">2-phase: Gamma → CLOB<br>odds · spread · history</div>
+        </div>
+        <div class="card c-blue" onclick="showDetail('whale-svc')">
+          <div class="card-icon">🐋</div>
+          <div class="card-title">whaleMonitor.js</div>
+          <div class="card-sub">Large BTC transactions<br>Deposit/withdraw sentiment</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="big-arrow">↓</div>
+
+    <!-- LAYER 3: Processing Layer -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">🧠</span>
+        <span class="section-title" style="color:var(--purple)">Layer 3 — Intelligence Layer <span style="font-family:'Share Tech Mono';font-size:10px;color:var(--muted)">src/ai/ · src/utils/</span></span>
+        <span class="section-desc">Transforms raw OHLCV into decisions.<br>This is the brain of the oracle.</span>
+      </div>
+      <div class="grid-3">
+        <div class="card c-yellow" onclick="showDetail('indicators')">
+          <div class="card-icon">📐</div>
+          <div class="card-title">indicators.js</div>
+          <div class="card-sub">MACD · RSI · StochRSI<br>BB · Supertrend · VWAP</div>
+        </div>
+        <div class="card c-purple" onclick="showDetail('signal-engine')">
+          <div class="card-icon">⚡</div>
+          <div class="card-title">signalEngine.js</div>
+          <div class="card-sub">5-factor scoring · macro vote<br>UP / DOWN / NO BET</div>
+        </div>
+        <div class="card c-blue" onclick="showDetail('prediction')">
+          <div class="card-icon">🤖</div>
+          <div class="card-title">predictionModel.js</div>
+          <div class="card-sub">AI momentum predictor<br>Adaptive weight learning</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="big-arrow">↓</div>
+
+    <!-- LAYER 4: App / State -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">⚛️</span>
+        <span class="section-title" style="color:var(--green)">Layer 4 — App State <span style="font-family:'Share Tech Mono';font-size:10px;color:var(--muted)">App.jsx</span></span>
+        <span class="section-desc">React state orchestrates everything.<br>Persists key data to localStorage.</span>
+      </div>
+      <div class="grid-4">
+        <div class="card c-orange" onclick="showDetail('state-market')">
+          <div class="card-icon">💹</div>
+          <div class="card-title">Market State</div>
+          <div class="card-sub">price · tfData · wsLive<br>chartData · stats24h</div>
+        </div>
+        <div class="card c-purple" onclick="showDetail('state-poly')">
+          <div class="card-icon">🎯</div>
+          <div class="card-title">Polymarket State</div>
+          <div class="card-sub">upOdds · dnOdds · threshold<br>spreadData · oddsHistory</div>
+        </div>
+        <div class="card c-yellow" onclick="showDetail('state-bet')">
+          <div class="card-icon">💰</div>
+          <div class="card-title">Betting State</div>
+          <div class="card-sub">balance · paperBets<br>betHistory · pendingBet<br><span style="color:var(--green)">💾 persisted</span></div>
+        </div>
+        <div class="card c-blue" onclick="showDetail('state-ai')">
+          <div class="card-icon">🧠</div>
+          <div class="card-title">AI State</div>
+          <div class="card-sub">weights · aiLog · pred<br>aiPred · market<br><span style="color:var(--green)">💾 persisted</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="big-arrow">↓</div>
+
+    <!-- LAYER 5: UI -->
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">🖥️</span>
+        <span class="section-title" style="color:var(--yellow)">Layer 5 — UI Tabs</span>
+        <span class="section-desc">7 views, each reads from shared app state.<br>All rendered client-side in React.</span>
+      </div>
+      <div class="grid-6" style="gap:8px">
+        <div class="card c-orange" onclick="showDetail('tab-dash')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">🐾</div>
+          <div class="card-title" style="font-size:12px">Dashboard</div>
+          <div class="card-sub">Main view</div>
+        </div>
+        <div class="card c-yellow" onclick="showDetail('tab-chart')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">📊</div>
+          <div class="card-title" style="font-size:12px">Chart</div>
+          <div class="card-sub">Candlesticks</div>
+        </div>
+        <div class="card c-green" onclick="showDetail('tab-bot')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">🤖</div>
+          <div class="card-title" style="font-size:12px">Auto-Bot</div>
+          <div class="card-sub">Bot control</div>
+        </div>
+        <div class="card c-blue" onclick="showDetail('tab-whales')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">🐋</div>
+          <div class="card-title" style="font-size:12px">Whales</div>
+          <div class="card-sub">TX monitor</div>
+        </div>
+        <div class="card c-purple" onclick="showDetail('tab-ai')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">🧠</div>
+          <div class="card-title" style="font-size:12px">AI Lab</div>
+          <div class="card-sub">Weights</div>
+        </div>
+        <div class="card" onclick="showDetail('tab-rules')" style="padding:10px 12px">
+          <div style="font-size:16px;margin-bottom:4px">📋</div>
+          <div class="card-title" style="font-size:12px">Rules</div>
+          <div class="card-sub">+ Schedule</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Detail Panel -->
+    <div class="detail-panel slide-in" id="detail-panel">
+      <div style="text-align:center;color:var(--muted);font-size:11px;font-weight:700;padding:20px">
+        👆 Click any block above to see what it does
+      </div>
+    </div>
+
+  </div><!-- /overview -->
+
+  <!-- ══════════════════════ DATA FLOW TAB ══════════════════════ -->
+  <div id="view-dataflow" class="view">
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">⚡</span>
+        <span class="section-title" style="color:var(--orange)">How data flows from the internet → your prediction</span>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">1</div>
+        <div class="step-content">
+          <div class="step-title">📡 Binance WebSocket connects on page load</div>
+          <div class="step-desc">
+            <span class="pipe" style="color:var(--green)">wss://stream.binance.com</span> → proxied via Vite → <span class="pipe" style="color:var(--orange)">binanceWS.js</span><br>
+            Fires every trade. Updates <code style="color:var(--yellow)">price</code> state in real-time. Fallback to REST polling if WS drops.
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">2</div>
+        <div class="step-content">
+          <div class="step-title">📊 Fetch Data button → 6 timeframes in parallel</div>
+          <div class="step-desc">
+            <span class="pipe" style="color:var(--orange)">binanceApi.js</span> calls <code style="color:var(--yellow)">/klines?symbol=BTCUSDT&interval=1m/5m/15m/30m/1h/4h</code><br>
+            Returns 200 candles each. Runs <span class="pipe" style="color:var(--purple)">indicators.js</span> on every timeframe:
+            MACD · RSI · StochRSI · Bollinger Bands · Supertrend · VWAP.
+            Stored in <code style="color:var(--yellow)">tfData</code> state.
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">3</div>
+        <div class="step-content">
+          <div class="step-title">🎯 ⚡ Auto button → 2-phase Polymarket fetch</div>
+          <div class="step-desc">
+            <strong style="color:var(--purple)">Phase 1 (Gamma API):</strong> finds active BTC UP/DOWN market, scores candidates by time-to-expiry + liquidity + has $ threshold. Extracts token IDs.<br>
+            <strong style="color:var(--blue)">Phase 2 (CLOB API):</strong> uses token IDs to get real live <code style="color:var(--yellow)">upOdds / downOdds</code> from actual traded price. Then non-blocking: fetches spread + 1h price history.<br>
+            Stores: <span class="pipe" style="color:var(--yellow)">upOdds</span> <span class="pipe" style="color:var(--yellow)">dnOdds</span> <span class="pipe" style="color:var(--yellow)">threshold</span> <span class="pipe" style="color:var(--yellow)">spreadData</span> <span class="pipe" style="color:var(--yellow)">oddsHistory</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">4</div>
+        <div class="step-content">
+          <div class="step-title">🐋 Whale Monitor → fetches every 60 seconds</div>
+          <div class="step-desc">
+            <span class="pipe" style="color:var(--blue)">whaleMonitor.js</span> fetches large BTC transactions. Classifies each as BULLISH (exchange withdrawal) or BEARISH (exchange deposit). Computes <code style="color:var(--yellow)">whaleSentiment.score</code> and <code style="color:var(--yellow)">whaleSentiment.label</code>.
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">5</div>
+        <div class="step-content">
+          <div class="step-title">⚡ signalEngine.js → builds the main prediction</div>
+          <div class="step-desc">
+            Runs every time any input changes (price, odds, weights, whale). Scores 5 factors:<br>
+            <span class="pipe" style="color:var(--orange)">Market Odds ≥53¢</span>
+            <span class="pipe" style="color:var(--orange)">Price Buffer</span>
+            <span class="pipe" style="color:var(--orange)">5m MACD</span>
+            <span class="pipe" style="color:var(--orange)">1m MACD</span>
+            <span class="pipe" style="color:var(--orange)">Multi-TF Vote</span><br>
+            Need 3+/5 to get UP or DOWN. Then adjusts confidence with whale, StochRSI, spread, BB, Supertrend. Hard-blocks: Dangerous · Whale Dom · Low Liq · Coin flip · StochRSI extreme.
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">6</div>
+        <div class="step-content">
+          <div class="step-title">🤖 predictionModel.js → AI momentum cross-check</div>
+          <div class="step-desc">
+            Parallel to signalEngine. Weighs 4H (3pts) · 1H+VWAP (3pts) · 15m (1.5pts) · 5m · 1m momentum · RSI · BB · StochRSI.<br>
+            Returns <span class="pipe" style="color:var(--purple)">dir: UP/DOWN/SIDEWAYS</span> + confidence. Shown as "AI Momentum" widget.<br>
+            When a bet resolves → <code style="color:var(--yellow)">updateWeights()</code> reinforces or penalises each feature.
+          </div>
+        </div>
+      </div>
+
+      <div class="flow-step">
+        <div class="step-num">7</div>
+        <div class="step-content">
+          <div class="step-title">💾 Result rendered + persisted to localStorage</div>
+          <div class="step-desc">
+            Final <code style="color:var(--yellow)">pred</code> and <code style="color:var(--yellow)">aiPred</code> shown in Dashboard. Bet placed → balance deducted → stored.<br>
+            On every change: <span class="pipe" style="color:var(--green)">weights</span> <span class="pipe" style="color:var(--green)">balance</span> <span class="pipe" style="color:var(--green)">betHistory</span> <span class="pipe" style="color:var(--green)">paperBets</span> <span class="pipe" style="color:var(--green)">aiLog</span> all write to localStorage → survives page refresh and app restart.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══════════════════════ BOT ROUND TAB ══════════════════════ -->
+  <div id="view-botflow" class="view">
+    <div class="section">
+      <div class="section-head">
+        <span class="section-icon">🤖</span>
+        <span class="section-title" style="color:var(--green)">What happens every 5-minute Polymarket round</span>
+      </div>
+
+      <!-- Timeline -->
+      <div style="position:relative; padding-left:36px; margin-top:8px">
+        <div style="position:absolute;left:14px;top:0;bottom:0;width:2px;background:linear-gradient(to bottom,var(--orange),var(--purple),var(--green));border-radius:2px;opacity:.4"></div>
+
+        <div style="margin-bottom:22px;position:relative">
+          <div style="position:absolute;left:-30px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--orange);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">0</div>
+          <div style="font-family:'Fredoka One',sans-serif;font-size:14px;color:var(--orange);margin-bottom:4px">T = 0:00 — New round starts</div>
+          <div style="font-size:10px;color:var(--muted);font-weight:700;line-height:1.8">
+            Polymarket publishes a new market: <em>"Will BTC be above $69,500 at 8:05 PM?"</em><br>
+            Bot resets <code style="color:var(--yellow)">fetchedThisRound = false</code>, <code style="color:var(--yellow)">bettedThisRound = false</code>.<br>
+            Status: <span class="pipe" style="color:var(--green)">WATCHING</span> — timer counts down from 5:00.
+          </div>
+        </div>
+
+        <div style="margin-bottom:22px;position:relative">
+          <div style="position:absolute;left:-30px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--yellow);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">1</div>
+          <div style="font-family:'Fredoka One',sans-serif;font-size:14px;color:var(--yellow);margin-bottom:4px">T = 4:00–4:05 (55–65s before end)</div>
+          <div style="font-size:10px;color:var(--muted);font-weight:700;line-height:1.8">
+            Bot fires <code style="color:var(--yellow)">fetchData()</code> — refreshes all 6 timeframes from Binance.<br>
+            Sets <code style="color:var(--yellow)">fetchedThisRound = true</code> so it doesn't fetch again this round.<br>
+            Status: <span class="pipe" style="color:var(--yellow)">ANALYZING</span>
+          </div>
+        </div>
+
+        <div style="margin-bottom:22px;position:relative">
+          <div style="position:absolute;left:-30px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--purple);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">2</div>
+          <div style="font-family:'Fredoka One',sans-serif;font-size:14px;color:var(--purple);margin-bottom:4px">T = 4:10–4:20 (40–50s before end)</div>
+          <div style="font-size:10px;color:var(--muted);font-weight:700;line-height:1.8">
+            <strong style="color:var(--text)">Decision moment.</strong> Bot reads current <code style="color:var(--yellow)">pred</code> signal.<br><br>
+            <strong style="color:var(--red)">Skip if any of:</strong> signal is NO BET · balance &lt; bet size · bettedThisRound already true<br>
+            <strong style="color:var(--green)">Bet if:</strong> signal is UP or DOWN with score ≥3/5<br><br>
+            Sets <code style="color:var(--yellow)">bettedThisRound = true</code>. Deducts bet from balance. Stores as pending bet.<br>
+            Status: <span class="pipe" style="color:var(--purple)">BETTING</span> or <span class="pipe" style="color:var(--muted)">SKIP logged</span>
+          </div>
+        </div>
+
+        <div style="margin-bottom:22px;position:relative">
+          <div style="position:absolute;left:-30px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--blue);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">3</div>
+          <div style="font-family:'Fredoka One',sans-serif;font-size:14px;color:var(--blue);margin-bottom:4px">T = 4:50–5:00 (1–5s before end)</div>
+          <div style="font-size:10px;color:var(--muted);font-weight:700;line-height:1.8">
+            <strong style="color:var(--text)">Auto-resolution.</strong> Bot reads live <code style="color:var(--yellow)">price</code> from WebSocket.<br><br>
+            <strong style="color:var(--green)">If threshold set (real Polymarket):</strong> UP wins if price &gt; threshold, DOWN wins if price &lt; threshold.<br>
+            <strong style="color:var(--yellow)">If no threshold (Smart Fill):</strong> compares exit price vs entry price.<br><br>
+            Status: <span class="pipe" style="color:var(--green)">WIN ✅</span> or <span class="pipe" style="color:var(--red)">LOSS ❌</span> logged to Bot Activity Log.
+          </div>
+        </div>
+
+        <div style="position:relative">
+          <div style="position:absolute;left:-30px;top:2px;width:16px;height:16px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;color:#050510">4</div>
+          <div style="font-family:'Fredoka One',sans-serif;font-size:14px;color:var(--green);margin-bottom:4px">Immediately after — AI learns</div>
+          <div style="font-size:10px;color:var(--muted);font-weight:700;line-height:1.8">
+            <code style="color:var(--yellow)">updateWeights(weights, features, won, conf)</code> is called.<br>
+            Each signal feature that fired gets its weight bumped (win) or reduced (loss).<br>
+            Higher confidence bets have more impact on weight changes (adaptive learning rate).<br>
+            Wrong bets cost 20% more than correct bets earn — discourages overconfidence.<br>
+            Balance, betHistory, weights all written to <span class="pipe" style="color:var(--green)">localStorage</span>. Round complete. 🐾
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Signal scoring breakdown -->
+    <div class="section" style="margin-top:16px">
+      <div class="section-head">
+        <span class="section-icon">⚡</span>
+        <span class="section-title" style="color:var(--orange)">Signal Scoring — How UP / DOWN / NO BET is decided</span>
+      </div>
+      <div class="grid-2">
+        <div>
+          <div style="font-size:10px;color:var(--muted);font-weight:800;letter-spacing:1px;margin-bottom:10px">5 SCORED FACTORS</div>
+          <div style="display:flex;flex-direction:column;gap:7px">
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg2);border-radius:8px">
+              <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,109,0,.15);display:flex;align-items:center;justify-content:center;font-family:'Fredoka One',sans-serif;font-size:12px;color:var(--orange);flex-shrink:0">1</div>
+              <div><div style="font-size:11px;font-weight:800;color:var(--text)">Market Odds ≥ 53¢</div><div style="font-size:9px;color:var(--muted)">Real edge over 50/50. From Polymarket.</div></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg2);border-radius:8px">
+              <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,109,0,.15);display:flex;align-items:center;justify-content:center;font-family:'Fredoka One',sans-serif;font-size:12px;color:var(--orange);flex-shrink:0">2</div>
+              <div><div style="font-size:11px;font-weight:800;color:var(--text)">Price Buffer (side of threshold)</div><div style="font-size:9px;color:var(--muted)">Price above threshold for UP, below for DOWN.</div></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg2);border-radius:8px">
+              <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,109,0,.15);display:flex;align-items:center;justify-content:center;font-family:'Fredoka One',sans-serif;font-size:12px;color:var(--orange);flex-shrink:0">3</div>
+              <div><div style="font-size:11px;font-weight:800;color:var(--text)">5m MACD direction</div><div style="font-size:9px;color:var(--muted)">Must agree with bet direction.</div></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg2);border-radius:8px">
+              <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,109,0,.15);display:flex;align-items:center;justify-content:center;font-family:'Fredoka One',sans-serif;font-size:12px;color:var(--orange);flex-shrink:0">4</div>
+              <div><div style="font-size:11px;font-weight:800;color:var(--text)">1m MACD direction</div><div style="font-size:9px;color:var(--muted)">Short-term momentum agrees.</div></div>
+            </div>
+            <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg2);border-radius:8px">
+              <div style="width:28px;height:28px;border-radius:50%;background:rgba(255,109,0,.15);display:flex;align-items:center;justify-content:center;font-family:'Fredoka One',sans-serif;font-size:12px;color:var(--orange);flex-shrink:0">5</div>
+              <div><div style="font-size:11px;font-weight:800;color:var(--text)">Multi-TF Weighted Vote</div><div style="font-size:9px;color:var(--muted)">4H×2.5 + 1H×1.5 + 30m/15m/5m/1m weighted majority.</div></div>
+            </div>
+          </div>
+        </div>
+        <div>
+          <div style="font-size:10px;color:var(--muted);font-weight:800;letter-spacing:1px;margin-bottom:10px">CONFIDENCE ADJUSTMENTS</div>
+          <div style="display:flex;flex-direction:column;gap:7px">
+            <div style="padding:8px 12px;background:var(--bg2);border-radius:8px;font-size:10px">
+              <div style="color:var(--text);font-weight:800;margin-bottom:3px">Base conf by score</div>
+              <div style="color:var(--muted)">3/5 → 55% · 4/5 → 62% · 5/5 → 67%</div>
+            </div>
+            <div style="padding:8px 12px;background:var(--bg2);border-radius:8px;font-size:10px">
+              <div style="color:var(--green);font-weight:800;margin-bottom:3px">+Boosts</div>
+              <div style="color:var(--muted)">TF vote strength · Whale aligned · Tight spread · BB extreme · Supertrend agrees</div>
+            </div>
+            <div style="padding:8px 12px;background:var(--bg2);border-radius:8px;font-size:10px">
+              <div style="color:var(--red);font-weight:800;margin-bottom:3px">−Penalties</div>
+              <div style="color:var(--muted)">StochRSI ceiling (−10) · Floor + bullish 4H (−12) · Wide spread · Crowd against bet</div>
+            </div>
+            <div style="padding:8px 12px;background:var(--bg2);border-radius:8px;font-size:10px">
+              <div style="color:var(--red);font-weight:800;margin-bottom:3px">🚫 Hard blocks (always NO BET)</div>
+              <div style="color:var(--muted)">Dangerous flag · Whale Dom · Low Liq · Coin flip 48–52¢ · StochRSI ≤1 or ≥99 · conf &lt;50%</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div><!-- /botflow -->
+
+</div><!-- /page -->
+
+<script>
+const DETAILS = {
+  'binance-ws': {
+    title: '📡 Binance WebSocket Stream',
+    items: [
+      { label: 'URL', val: 'wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@miniTicker' },
+      { label: 'Vite proxy path', val: '/binance-ws → proxied server-side, no CORS' },
+      { label: 'Trade stream', val: 'Fires on every BTC trade — updates live price in milliseconds' },
+      { label: 'miniTicker stream', val: '24h high/low/volume/change — updates every second' },
+      { label: 'Auto-reconnect', val: 'Reconnects every 5s if disconnected. Falls back to REST polling.' },
+      { label: 'Status indicator', val: 'Green dot = LIVE WebSocket. Red dot = POLL (REST).' },
+    ]
+  },
+  'binance-rest': {
+    title: '📊 Binance REST API',
+    items: [
+      { label: 'Base URL (proxied)', val: '/binance/api/v3 → https://api.binance.com/api/v3' },
+      { label: '/klines', val: 'Returns 200 OHLCV candles per timeframe. Called for 1m/5m/15m/30m/1h/4h in parallel.' },
+      { label: '/ticker/24hr', val: '24h stats: high, low, volume, % change' },
+      { label: '/ticker/price', val: 'Single current price — used as fallback when WS is offline' },
+      { label: 'Auto refresh', val: 'Fetches automatically every 30 seconds. Countdown shown in header.' },
+    ]
+  },
+  'polymarket': {
+    title: '🎯 Polymarket APIs',
+    items: [
+      { label: 'Gamma API', val: 'gamma-api.polymarket.com — finds active BTC markets, returns token IDs, liquidity, end time, question text (with $ threshold)' },
+      { label: 'CLOB API', val: 'clob.polymarket.com — live traded price (/price), spread (/spread), order depth (/book), 1h history (/prices-history)' },
+      { label: 'Data API', val: 'data-api.polymarket.com — builder analytics, positions (future use)' },
+      { label: 'Your Builder Key', val: 'VITE_POLY_API_KEY in .env — authenticates CLOB trading endpoints' },
+      { label: 'CORS fix', val: 'All 3 APIs proxied via vite.config.js so browser never gets blocked' },
+    ]
+  },
+  'binanceWS-svc': {
+    title: '🔌 binanceWS.js — WebSocket Manager',
+    items: [
+      { label: 'Pattern', val: 'Singleton with listener Set — multiple components subscribe to one WS connection' },
+      { label: 'subscribePriceStream(cb)', val: 'Main export. Returns an unsubscribe function. App.jsx calls this on mount.' },
+      { label: 'notifyAll(data)', val: 'Broadcasts price/ticker/status updates to all registered listeners' },
+      { label: 'Reconnect logic', val: 'setTimeout 5s on close. Clears on stopStream() to prevent memory leaks.' },
+    ]
+  },
+  'binanceApi-svc': {
+    title: '📈 binanceApi.js — REST Data Fetcher',
+    items: [
+      { label: 'fetchAllTimeframes()', val: 'Parallel Promise.allSettled for all 6 TFs. Partial success supported — missing TFs shown as "Failed"' },
+      { label: 'Per-timeframe output', val: 'opens · highs · lows · closes · volumes · macd · rsi · stochRSI · bb · supertrend · vwap · candles (last 60)' },
+      { label: 'fetch24hrStats()', val: '24h change %, high, low, volume — shown in Chart tab stats bar' },
+      { label: 'Error handling', val: 'Each TF catches individually — one failed TF does not break the others' },
+    ]
+  },
+  'polyApi-svc': {
+    title: '🎯 polymarketApi.js — Polymarket Service',
+    items: [
+      { label: 'fetchActiveBTCMarket()', val: 'Phase 1: Gamma search → scores markets → picks best active round. Phase 2: CLOB /price for real live odds.' },
+      { label: 'Market scoring', val: 'Prefers: ends in <5 mins (+10pts), has $ in question (+4pts), high liquidity (+3pts), has token IDs (+3pts)' },
+      { label: 'fetchMarketEnrichment(tokenId)', val: 'Non-blocking — called after main fetch. Gets spread quality + 1h odds history for sparkline.' },
+      { label: 'fetchSpreadSignal()', val: 'TIGHT (<3¢) / NORMAL (3-8¢) / WIDE (>8¢) + order imbalance from /book' },
+      { label: 'fetchOddsHistory()', val: 'Last 1h of UP odds (1-min fidelity) → plotted as sparkline in dashboard' },
+      { label: 'Fallback chain', val: 'CLOB fails → uses Gamma outcomePrices. Both fail → returns null → Smart Fill used.' },
+    ]
+  },
+  'whale-svc': {
+    title: '🐋 whaleMonitor.js — Whale Transaction Monitor',
+    items: [
+      { label: 'Refresh interval', val: 'Fetches every 60 seconds automatically' },
+      { label: 'BULLISH signal', val: 'Exchange withdrawals — whales taking BTC off exchange (accumulation)' },
+      { label: 'BEARISH signal', val: 'Exchange deposits — whales sending BTC to exchange (preparing to sell)' },
+      { label: 'getWhaleSentiment()', val: 'Returns { score, label, bullish count, bearish count }' },
+      { label: 'Signal weight', val: '±3% confidence adjustment in signalEngine. Also shown as standalone indicator.' },
+      { label: 'Demo mode', val: 'Add real API key to whaleMonitor.js for live data' },
+    ]
+  },
+  'indicators': {
+    title: '📐 indicators.js — Technical Indicators',
+    items: [
+      { label: 'calcMACD(closes)', val: 'EMA12 - EMA26 = MACD line. Signal = EMA9 of MACD. Hist = MACD - Signal. Returns { line, signal, hist, bullish, histArr }' },
+      { label: 'calcRSI(closes)', val: '14-period RSI. >70 = overbought, <30 = oversold.' },
+      { label: 'calcStochRSI(closes)', val: 'RSI of RSI. K line (3-period SMA). 0-100 scale. >80 overbought, <20 oversold.' },
+      { label: 'calcBB(closes)', val: 'Bollinger Bands: 20-period SMA ± 2σ. Returns upper/lower/mid/pct (0-100 position).' },
+      { label: 'calcSupertrend(h,l,c)', val: 'ATR-based trend indicator. Returns { bullish: bool, value }. Used as 4H confirmation.' },
+      { label: 'calcVWAP(h,l,c,v)', val: 'Volume-weighted average price. Price above = bullish, below = bearish. Only meaningful on 1H+.' },
+    ]
+  },
+  'signal-engine': {
+    title: '⚡ signalEngine.js — Signal Scoring Engine',
+    items: [
+      { label: 'buildSignal()', val: 'Main function. Takes all data → returns { result, conf, score, factors, reason, color, features }' },
+      { label: 'getMacro()', val: '4H MACD + RSI → BULLISH / BEARISH / NEUTRAL. 1H used as tiebreaker.' },
+      { label: 'getTrendVote()', val: 'Weighted vote: 4H×2.5, 1H×1.5, 30m/15m/5m×1, 1m×0.75. ≥58% = BULLISH majority.' },
+      { label: 'thresholdSource', val: "real = hard skip <$10 | smartfill = no hard skip | '' = hard skip <$10" },
+      { label: 'DEFAULT_WEIGHTS', val: 'odds/buffer/macd5m/macd1m/trend4h (1.0), macroStrength (.9), stochRSI (.8), spreadSignal (.8), supertrend (.7), whaleSentiment (.6), bbPosition (.5)' },
+      { label: 'features object', val: 'Passed to updateWeights() after resolution so AI knows which signals fired' },
+    ]
+  },
+  'prediction': {
+    title: '🤖 predictionModel.js — AI Prediction & Learning',
+    items: [
+      { label: 'predictDirection()', val: 'Pure momentum model. Scores: 4H MACD (3pts), 4H Supertrend (1pt), 1H MACD (2pts), VWAP (1pt), 15m MACD (1.5pts), 5m/1m MACD, 1m momentum slope, RSI, BB, StochRSI.' },
+      { label: 'Output', val: '{ dir: UP/DOWN/SIDEWAYS, conf: 0-78%, signals: [] }. Shown as "AI Momentum" on dashboard.' },
+      { label: 'updateWeights(weights, features, won, conf)', val: 'Adaptive LR = BASE_LR × confFactor. confFactor = 1.0 at 60%, 1.5 at 70%. Wrong bets cost 20% more.' },
+      { label: 'Weight bounds', val: 'MIN 0.10, MAX 2.00. Clamped to 4 decimal places.' },
+      { label: 'getWeightInsights()', val: 'Compares live weights vs defaults. Labels signals as "reliable" (+0.35) or "false signals" (−0.35).' },
+    ]
+  },
+  'state-market': {
+    title: '💹 Market State',
+    items: [
+      { label: 'price', val: 'Current BTC/USDT price. Updated by WebSocket on every trade.' },
+      { label: 'prevPrice', val: 'Previous price tick — used to colour price green/red on change.' },
+      { label: 'tfData', val: 'Object keyed by TF (1m/5m/etc) containing all indicator data for that timeframe.' },
+      { label: 'wsLive', val: 'Boolean — true when WebSocket is connected and streaming.' },
+      { label: 'chartData', val: 'Simplified price array for the mini sparkline chart. 60 points.' },
+      { label: 'refreshIn', val: 'Countdown timer 30→0. Auto-triggers fetchData() when it reaches 0.' },
+    ]
+  },
+  'state-poly': {
+    title: '🎯 Polymarket State',
+    items: [
+      { label: 'upOdds / dnOdds', val: 'Cents (0-100). Set by ⚡ Auto (real CLOB), 📊 Smart Fill (estimated), or manual.' },
+      { label: 'threshold', val: 'The $ price BTC must be above/below at round end.' },
+      { label: 'thresholdSource', val: '"real" / "smartfill" / "" — controls buffer skip behaviour in signalEngine.' },
+      { label: 'spreadData', val: '{ spreadCents, imbalance, quality } — from CLOB /spread. Modifies signal confidence.' },
+      { label: 'oddsHistory', val: 'Array of {t, p, time} — last 1h of UP odds. Rendered as sparkline.' },
+      { label: 'dangerous/whale/lowLiq', val: 'Manual override flags. Any = instant NO BET hard skip.' },
+    ]
+  },
+  'state-bet': {
+    title: '💰 Betting State (persisted to localStorage)',
+    items: [
+      { label: 'balance', val: 'Paper money balance. Starts at $100. Deducted on bet, returned+profit on win.' },
+      { label: 'paperBets', val: 'Array of all bets with outcome (null = pending). Used in Bet History.' },
+      { label: 'pendingBet', val: 'The single active unresolved bet. Auto-bot uses this to prevent double-betting.' },
+      { label: 'betHistory', val: 'Simplified resolved bet array: { correct, pnl, auto }. Used for win rate and P&L chart.' },
+      { label: 'betAmt', val: 'Current bet size input. Auto-bot uses this when placing bets.' },
+    ]
+  },
+  'state-ai': {
+    title: '🧠 AI State (persisted to localStorage)',
+    items: [
+      { label: 'weights', val: 'Live weight object. Starts at DEFAULT_WEIGHTS. Updated by updateWeights() after every resolution.' },
+      { label: 'pred', val: 'Output of buildSignal(). The main prediction. Drives bet button and auto-bot.' },
+      { label: 'aiPred', val: 'Output of predictDirection(). The AI momentum cross-check shown alongside pred.' },
+      { label: 'aiLog', val: 'Last 20 learning events. Each shows win/loss, direction, conf, and what changed.' },
+      { label: 'market', val: 'classifyMarket() output: BULLISH/BEARISH/NEUTRAL. Shown in header.' },
+    ]
+  },
+  'tab-dash': {
+    title: '🐾 Dashboard Tab — Main View',
+    items: [
+      { label: 'Left column', val: 'Polymarket panel (odds input + spread badge + odds sparkline + buffer), Paper Betting controls' },
+      { label: 'Centre column', val: '6-timeframe grid (MACD/RSI/StochRSI per TF) + mini price sparkline' },
+      { label: 'Right column', val: 'Confluence scorecard (5 factors) + Signal Prediction + AI Momentum + Skip Monitor' },
+    ]
+  },
+  'tab-chart': {
+    title: '📊 Chart Tab — Candlestick View',
+    items: [
+      { label: 'CandlestickChart.jsx', val: 'Full OHLCV candlestick chart. Last 60 candles of selected timeframe.' },
+      { label: 'Timeframe switcher', val: '1m / 5m / 15m / 30m / 1h / 4h buttons' },
+      { label: 'Overlays', val: 'Threshold line (price to beat) + VWAP line when available' },
+      { label: 'Stats bar', val: '24H High/Low/Volume/Change from Binance ticker' },
+      { label: 'MACD histogram', val: 'BarChart below candles showing histogram bars colour-coded green/red' },
+    ]
+  },
+  'tab-bot': {
+    title: '🤖 Auto-Bot Tab',
+    items: [
+      { label: 'START/STOP toggle', val: 'Enables/disables the 1-second interval ticker loop' },
+      { label: 'Status indicator', val: 'idle → watching → analyzing → betting → resolving → back to watching' },
+      { label: 'Bot Config', val: 'Bet size input (disabled while running). Shows timing and rules.' },
+      { label: 'Live Signal panel', val: 'Shows current pred in real-time + whether bot would bet this round' },
+      { label: 'Bot Stats', val: 'Balance, P&L, win rate, auto bets, skipped, bets won' },
+      { label: 'Activity Log', val: 'Timestamped log of every action: starts, fetches, bets, skips, wins, losses' },
+      { label: 'Round timer bar', val: 'Visual progress bar of current 5-min round + contextual status text' },
+    ]
+  },
+  'tab-whales': {
+    title: '🐋 Whales Tab',
+    items: [
+      { label: 'Transaction list', val: 'Recent large BTC transactions with amount, from/to, type, USD value' },
+      { label: 'Sentiment summary', val: 'BULLISH/BEARISH/NEUTRAL label + bullish/bearish counts' },
+      { label: 'Signal Impact panel', val: 'Explains how each transaction type affects prediction confidence' },
+      { label: 'Current Whale Signal', val: 'Live sentiment label + score. ±3% confidence effect on signal.' },
+    ]
+  },
+  'tab-ai': {
+    title: '🧠 AI Lab Tab',
+    items: [
+      { label: 'Stats grid', val: 'Total bets, win rate, P&L, balance — all from persisted betHistory' },
+      { label: 'Live Weights bars', val: 'Visual bar for each weight (0.1–2.0 scale). Green = reinforced, red = penalised.' },
+      { label: 'Reset Weights button', val: 'Resets weights back to DEFAULT_WEIGHTS' },
+      { label: 'Wipe All Data button', val: 'Clears all localStorage — balance, bets, weights, history (confirmation required)' },
+      { label: 'Learning Log', val: 'Last 20 resolved bets with win/loss, direction, confidence, and weight note' },
+      { label: 'Bet History list', val: 'Full scrollable history with WIN/LOSE buttons for manual resolution' },
+      { label: 'P&L Curve', val: 'LineChart of cumulative P&L over all bets — visible after 2+ bets' },
+    ]
+  },
+  'tab-rules': {
+    title: '📋 Rules + ⏰ Schedule Tabs',
+    items: [
+      { label: 'Rules tab', val: 'Static reference cards: Instant NO BET conditions, Winning patterns, Losing patterns, Whale rules' },
+      { label: 'Schedule tab', val: 'Best trading windows (EST), times to avoid, daily routine, bankroll rules' },
+      { label: 'Purpose', val: 'Manual checklist for when you are placing bets yourself (not using auto-bot)' },
+    ]
+  },
+};
+
+function showDetail(id) {
+  const d = DETAILS[id];
+  if (!d) return;
+  const panel = document.getElementById('detail-panel');
+  panel.className = 'detail-panel slide-in';
+  panel.innerHTML = `
+    <div class="detail-title">${d.title}</div>
+    <div class="detail-grid">
+      ${d.items.map(item => `
+        <div class="detail-item">
+          <div class="detail-item-label">${item.label}</div>
+          <div class="detail-item-val">${item.val}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  // highlight clicked card
+  document.querySelectorAll('.card').forEach(c => c.classList.remove('active'));
+  // scroll panel into view
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function showTab(tab) {
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('on'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('on'));
+  document.getElementById('view-' + tab).classList.add('on');
+  event.target.classList.add('on');
+}
+</script>
+</body>
+</html>
