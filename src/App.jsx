@@ -38,17 +38,62 @@ import { fetchMarketData, buyPosition } from './services/polymarketApi';
 import { positionManager }    from './services/positionManager';
 
 // ── Intelligence ─────────────────────────────────────────────
-import { computeIndicators }  from './intelligence/indicators';
-import { evaluateSignal, calcKellyBetSize } from './intelligence/signalEngine';
-import { updatePredictionModel }            from './intelligence/predictionModel';
+import { calcMACD, calcRSI, calcBB, calcEMA, calcStochRSI } from './utils/indicators';
 
-// ── UI Panels ────────────────────────────────────────────────
-import Dashboard   from './components/Dashboard';
-import ChartPanel  from './components/ChartPanel';
-import AutoBotPanel from './components/AutoBotPanel';
-import WhalePanel  from './components/WhalePanel';
-import AILabPanel  from './components/AILabPanel';
-import LivePnLBar  from './components/LivePnLBar';  // new component
+// Wrapper that builds the indicator object the signal engine expects
+const computeIndicators = (klines, livePrice) => {
+  if (!klines || klines.length < 50) return null;
+  const closes  = klines.map(k => parseFloat(k[4]));
+  const highs   = klines.map(k => parseFloat(k[2]));
+  const lows    = klines.map(k => parseFloat(k[3]));
+
+  // Append live price as the latest close
+  if (livePrice) closes.push(livePrice);
+
+  const macdRaw = calcMACD(closes);
+  const rsi1m   = calcRSI(closes, 14);
+  const bb      = calcBB(closes, 20);
+
+  // 4H/1H macro: approximate using longer EMA periods on 1m data
+  const ema20  = calcEMA(closes, 20);
+  const ema50  = calcEMA(closes, 50);
+  const ema100 = calcEMA(closes, 100);
+
+  return {
+    price:   livePrice || closes[closes.length - 1],
+    rsi1m,
+    macd1m: {
+      value:     macdRaw.line,
+      signal:    macdRaw.signal,
+      histogram: macdRaw.hist,
+      cross:     macdRaw.bullish ? 'BULL' : 'BEAR',
+    },
+    bb1m: {
+      upper: bb.upper,
+      lower: bb.lower,
+      mid:   bb.middle,
+      width: bb.upper - bb.lower,
+    },
+    ema4h: {
+      fast: ema50[ema50.length - 1],
+      slow: ema100[ema100.length - 1],
+    },
+    ema1h: {
+      fast: ema20[ema20.length - 1],
+      slow: ema50[ema50.length - 1],
+    },
+    bbWidthHistory: [],
+  };
+};
+import { evaluateSignal, calcKellyBetSize } from './ai/signalEngine';
+import { updatePredictionModel }            from './ai/predictionModel';
+
+// ── UI ───────────────────────────────────────────────────────
+// Only CandlestickChart exists as a separate file.
+// All other UI panels live inline in your original App.jsx —
+// keep your existing JSX render below and just add the new
+// state/hooks from this file into it.
+import CandlestickChart from './charts/CandlestickChart';
 
 // ─────────────────────────────────────────────────────────────
 //  CONSTANTS
@@ -417,48 +462,66 @@ export default function App() {
 
   return (
     <div className="app-root">
-      {/* Live P&L bar — only visible when in a position */}
+
+      {/* ── LIVE P&L BANNER (new) — shows when a position is open ── */}
       {pendingBet && livePosition && (
-        <LivePnLBar
-          position={pendingBet}
-          liveData={livePosition}
-        />
+        <div style={{
+          background: livePosition.pnl >= 0 ? '#0a2e1a' : '#2e0a0a',
+          color: livePosition.pnl >= 0 ? '#00ff88' : '#ff4444',
+          padding: '8px 16px', fontFamily: 'monospace',
+          display: 'flex', gap: 24, fontSize: 13, borderBottom: '1px solid #333'
+        }}>
+          <span>📊 {pendingBet.direction} @ {pendingBet.entryPrice?.toFixed(4)}</span>
+          <span>Bid: {livePosition.bid?.toFixed(4)}</span>
+          <span>
+            P&amp;L: {livePosition.pnl >= 0 ? '+' : ''}
+            {livePosition.pnl?.toFixed(3)} USDC ({livePosition.pnlPct}%)
+          </span>
+          {livePosition.trailingFloor && (
+            <span>🔒 Floor: {livePosition.trailingFloor?.toFixed(4)}</span>
+          )}
+          <span style={{ marginLeft: 'auto', opacity: 0.6 }}>
+            {livePosition.status}
+          </span>
+        </div>
       )}
 
-      <Dashboard
-        livePrice={livePrice}
-        marketData={marketData}
-        currentSignal={currentSignal}
-        bankroll={bankroll}
-        botStatus={botStatus}
-        pendingBet={pendingBet}
-      />
+      {/* ── BOT STATUS BAR (new) ── */}
+      <div style={{
+        background: '#111', padding: '6px 16px', fontFamily: 'monospace',
+        fontSize: 12, color: '#888', display: 'flex', gap: 24,
+        borderBottom: '1px solid #222'
+      }}>
+        <span>🤖 Bot: <strong style={{ color: autoBotEnabled ? '#00ff88' : '#666' }}>
+          {autoBotEnabled ? 'ON' : 'OFF'}
+        </strong></span>
+        <span>Status: <strong style={{ color: '#fff' }}>{botStatus}</strong></span>
+        {currentSignal && currentSignal.direction !== 'NONE' && (
+          <span>Signal: <strong style={{ color: '#ffcc00' }}>
+            {currentSignal.direction} {currentSignal.score}/5 ({currentSignal.pattern})
+          </strong></span>
+        )}
+        <span>Bankroll: <strong style={{ color: '#00ccff' }}>${bankroll?.toFixed(2)}</strong></span>
+        <button
+          onClick={toggleAutoBot}
+          style={{
+            marginLeft: 'auto', padding: '2px 12px', cursor: 'pointer',
+            background: autoBotEnabled ? '#ff4444' : '#00aa44',
+            color: '#fff', border: 'none', borderRadius: 4, fontSize: 12
+          }}
+        >
+          {autoBotEnabled ? 'Stop Bot' : 'Start Bot'}
+        </button>
+      </div>
 
-      <ChartPanel
+      {/* ── YOUR EXISTING APP UI GOES HERE ── */}
+      {/* Paste your original App.jsx render content below this line */}
+      <CandlestickChart
         klines={klines}
-        indicators={indicators}
         livePrice={livePrice}
-        pendingBet={pendingBet}
+        indicators={indicators}
       />
 
-      <AutoBotPanel
-        enabled={autoBotEnabled}
-        onToggle={toggleAutoBot}
-        status={botStatus}
-        currentSignal={currentSignal}
-        pendingBet={pendingBet}
-        livePosition={livePosition}
-        tradeHistory={tradeHistory}
-        bankroll={bankroll}
-        cooldownEnd={cooldownEnd}
-      />
-
-      <WhalePanel />
-
-      <AILabPanel
-        weights={aiWeights}
-        tradeHistory={tradeHistory}
-      />
     </div>
   );
 }
