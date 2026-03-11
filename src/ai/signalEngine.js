@@ -1,545 +1,332 @@
-/**
- * ============================================================
- * signalEngine.js  —  BabyDoge BTC Oracle v3
- * 5-Factor + Dip/Mountain Catcher + Volatility Squeeze Filter
- * ============================================================
- *
- * SIGNAL SCORING ARCHITECTURE
- * ────────────────────────────
- *  The engine produces a composite score [0–5] and a direction
- *  ('UP' | 'DOWN' | 'NONE').  Each of the 5 factors contributes
- *  at most 1.0 point.  Fractional points allow nuance.
- *
- *  Factor 1: MACD (1m)          — momentum direction
- *  Factor 2: RSI  (1m)          — overbought / oversold
- *  Factor 3: Bollinger Bands    — price vs band extremes + squeeze
- *  Factor 4: Macro Trend        — 4H/1H EMAs for higher-timeframe bias
- *  Factor 5: Polymarket Odds    — crowd wisdom alignment
- *
- * SPECIAL PATTERN DETECTORS (override / boost base score)
- * ─────────────────────────────────────────────────────────
- *  "Dip Catcher":      1m RSI < 25  AND  4H macro is BULLISH
- *                      → fires aggressive UP signal (score boosted to 5/5)
- *
- *  "Mountain Catcher": 1m RSI > 80  AND  price touches upper BB
- *                      AND macro is BEARISH
- *                      → fires aggressive DOWN signal (score boosted to 5/5)
- *
- *  "Squeeze Block":    BB width < historical squeeze threshold
- *                      → blocks ALL new entries until breakout detected
- *
- * ============================================================
- */
+// ─── SIGNAL SCORING ENGINE v3.1 ─────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────
-//  THRESHOLDS  (all tunable)
-// ─────────────────────────────────────────────────────────────
-
-const RSI = {
-  OVERSOLD_EXTREME:  25,   // Dip Catcher fires here
-  OVERSOLD:          35,   // Normal buy bias
-  OVERBOUGHT:        65,   // Normal sell bias
-  OVERBOUGHT_EXTREME: 80,  // Mountain Catcher fires here
+export const DEFAULT_WEIGHTS = {
+  odds:           1.0,
+  buffer:         1.0,
+  macd5m:         1.0,
+  macd1m:         1.0,
+  trend4h:        1.0,
+  stochRSI:       0.8,
+  macroStrength:  0.9,
+  whaleSentiment: 0.6,
+  bbPosition:     0.5,
+  supertrend:     0.7,
+  spreadSignal:   0.8, // tight spread = market confidence signal
 };
 
-const MACD = {
-  STRONG_BULL_THRESHOLD:  0.5,   // histogram > 0.5 = strong bull
-  STRONG_BEAR_THRESHOLD: -0.5,   // histogram < -0.5 = strong bear
-};
+// ── MACRO DETECTION ───────────────────────────────────────────────────────────
+// Primary: 4H MACD direction. RSI confirms strength, 1H used as tiebreaker.
+export function getMacro(tfData) {
+  const d4h = tfData?.['4h'];
+  const d1h = tfData?.['1h'];
+  if (!d4h) return 'N/A';
 
-const BB = {
-  /**
-   * Price must be this far through the band (0 = midline, 1 = band edge)
-   * to score a full point.  0.85 = within the top/bottom 15% of the band.
-   */
-  BAND_TOUCH_RATIO: 0.85,
+  const macdBull = d4h.macd.bullish;
+  const rsi      = d4h.rsi ?? 50;
 
-  /**
-   * Squeeze threshold: if BB width (as % of price) is below this,
-   * the market is coiling and we should NOT trade (false breakouts).
-   * Typical BTC 1m BB width is 0.3–0.8 %; < 0.15 % = squeeze.
-   */
-  SQUEEZE_PCT_THRESHOLD: 0.0015, // 0.15 % of price
+  if (macdBull && rsi > 30) return 'BULLISH';
+  if (!macdBull && rsi < 70) return 'BEARISH';
 
-  /**
-   * To confirm a breakout FROM a squeeze, price must close
-   * outside the band by at least this fraction of band width.
-   */
-  BREAKOUT_CONFIRMATION_RATIO: 0.10,
-};
-
-const MACRO = {
-  /**
-   * For the 4H/1H EMA trend, we compare two EMAs.
-   * If fast > slow by this %, it's a BULLISH macro.
-   */
-  EMA_BULL_DIFF_PCT: 0.002,  // 0.2 %
-  EMA_BEAR_DIFF_PCT: -0.002,
-};
-
-const ODDS = {
-  STRONG_ALIGNMENT: 65,  // Polymarket YES > 65 % → full UP score
-  STRONG_COUNTER:   35,  // Polymarket YES < 35 % → full DOWN score
-};
-
-/** Minimum score to fire a trading signal */
-const MIN_SIGNAL_SCORE = 3.0;
-
-/** Score required for an "aggressive" entry (Dip/Mountain pattern) */
-const AGGRESSIVE_SCORE = 5.0;
-
-// ─────────────────────────────────────────────────────────────
-//  MAIN EXPORT: evaluateSignal()
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Evaluate all indicators and return a unified signal object.
- *
- * @param {object} indicators — output from indicators.js
- *   {
- *     // 1-minute timeframe
- *     macd1m:   { value: number, signal: number, histogram: number, cross: 'BULL'|'BEAR'|null }
- *     rsi1m:    number
- *     bb1m:     { upper: number, lower: number, mid: number, width: number }
- *     price:    number   (current live price)
- *
- *     // 4H / 1H macro
- *     ema4h:    { fast: number, slow: number }
- *     ema1h:    { fast: number, slow: number }
- *
- *     // Historical BB widths for squeeze detection (array, newest last)
- *     bbWidthHistory: number[]
- *   }
- *
- * @param {object} marketData — from polymarketApi.fetchMarketData()
- *   { yes: number, no: number }
- *
- * @returns {SignalResult}
- *   {
- *     direction:  'UP'|'DOWN'|'NONE'
- *     score:      number (0–5)
- *     confidence: 'NONE'|'WEAK'|'MODERATE'|'STRONG'|'AGGRESSIVE'
- *     factors:    object  (breakdown of each factor score)
- *     pattern:    string  (e.g. 'DIP_CATCHER', 'MOUNTAIN_CATCHER', 'SQUEEZE_BLOCK')
- *     blocked:    boolean (true = do not trade this tick)
- *     macdSignal: 'BULLISH'|'BEARISH'|'NEUTRAL'  (for positionManager.js)
- *     reason:     string  (human-readable summary)
- *   }
- */
-export function evaluateSignal(indicators, marketData = { yes: 50, no: 50 }) {
-  const {
-    macd1m,
-    rsi1m,
-    bb1m,
-    price,
-    ema4h,
-    ema1h,
-    bbWidthHistory = [],
-  } = indicators;
-
-  // ── Guard: require minimum data ────────────────────────────
-  if (!price || !rsi1m || !bb1m || !macd1m) {
-    return _blocked('INSUFFICIENT_DATA', 'Not enough indicator data yet');
+  // Tiebreak via 1H
+  if (d1h) {
+    if (macdBull  && d1h.macd.bullish)  return 'BULLISH';
+    if (!macdBull && !d1h.macd.bullish) return 'BEARISH';
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  STEP 1: SQUEEZE FILTER  (must check before anything else)
-  // ─────────────────────────────────────────────────────────────
+  return 'NEUTRAL';
+}
 
-  const squeezeState = detectSqueeze(bb1m, price, bbWidthHistory);
+export function getMacroNote(tfData) {
+  const d = tfData?.['4h'];
+  if (!d) return '';
+  if ( d.macd.bullish && d.rsi < 40) return ` (RSI ${d.rsi?.toFixed(0)} — recovery)`;
+  if (!d.macd.bullish && d.rsi > 60) return ` (RSI ${d.rsi?.toFixed(0)} — correction)`;
+  return '';
+}
 
-  if (squeezeState.inSqueeze && !squeezeState.breakoutDetected) {
-    return _blocked(
-      'SQUEEZE_BLOCK',
-      `BB squeeze active (width ${(squeezeState.currentWidthPct * 100).toFixed(3)}%). ` +
-      `Waiting for breakout confirmation.`
-    );
+// ── MULTI-TIMEFRAME TREND VOTE ─────────────────────────────────────────────
+// Weighted vote across all TFs. 4H = 2.5×, 1H = 1.5×, others = 1×
+// Returns { bullish, bearish, total, majority, pct }
+export function getTrendVote(tfData) {
+  // FIX: increased 4H weight from 2 → 2.5 to better reflect its importance
+  const TF_WEIGHTS = { '4h': 2.5, '1h': 1.5, '30m': 1.0, '15m': 1.0, '5m': 1.0, '1m': 0.75 };
+  let bull = 0, bear = 0;
+  const detail = [];
+
+  Object.entries(TF_WEIGHTS).forEach(([tf, w]) => {
+    const d = tfData?.[tf];
+    if (!d) return;
+    if (d.macd.bullish) { bull += w; detail.push({ tf, bull: true  }); }
+    else                { bear += w; detail.push({ tf, bull: false }); }
+  });
+
+  const total   = bull + bear;
+  const bullPct = total > 0 ? Math.round((bull / total) * 100) : 50;
+  // FIX: tightened NEUTRAL band — 58/42 vs old 60/40
+  // A 58% vote is real signal, not a coin flip
+  const majority = bullPct >= 58 ? 'BULLISH' : bullPct <= 42 ? 'BEARISH' : 'NEUTRAL';
+
+  return { bull, bear, total, majority, pct: bullPct, detail };
+}
+
+// ── MAIN SIGNAL BUILDER ───────────────────────────────────────────────────────
+export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresholdSource, dangerous, whale, lowLiq, whaleSentiment, weights, spreadData }) {
+
+  // ── Hard skips ────────────────────────────────────────────────────────────
+  if (dangerous) return nobet('🔴 DANGEROUS flag — instant skip.', '#ffd700', []);
+  if (whale)     return nobet('🐋 Whale Dominated — skip.', '#ffd700', []);
+  if (lowLiq)    return nobet('💧 Low Liquidity <85K — skip.', '#ffd700', []);
+
+  const upV     = parseFloat(upOdds)   || 0;
+  const dnV     = parseFloat(downOdds) || 0;
+  const threshV = parseFloat(threshold) || 0;
+  const cur     = price || 0;
+
+  if (!upV && !dnV) return pending('Enter Polymarket odds — click 📊 Smart Fill or type manually.');
+  if (upV >= 48 && upV <= 52) return nobet('⚖️ Coin flip 48–52¢ — no edge.', '#ffd700', []);
+
+  // Buffer skip — behaviour depends on threshold source:
+  // 'real'      = from Polymarket API → hard skip <$10 (real money threshold matters)
+  // 'smartfill' = estimated from chart → only warn, never hard skip (it's just an estimate)
+  // unknown     = hard skip <$10 to be safe
+  const bufAbs = threshV > 0 ? Math.abs(cur - threshV) : null;
+  if (bufAbs !== null && thresholdSource !== 'smartfill') {
+    if (bufAbs < 10)
+      return nobet(`⚠️ Price only $${bufAbs.toFixed(0)} from threshold — too close, skip.`, '#ffd700', []);
   }
 
-  // ─────────────────────────────────────────────────────────────
-  //  STEP 2: MACRO TREND (4H / 1H)
-  // ─────────────────────────────────────────────────────────────
+  const d4h = tfData?.['4h'], d1h = tfData?.['1h'], d5m = tfData?.['5m'], d1m = tfData?.['1m'];
+  if (!d4h || !d5m || !d1m) return pending('Chart data loading — click Fetch Data.');
 
-  const macroTrend = getMacroTrend(ema4h, ema1h);
+  const macro     = getMacro(tfData);
+  const macroNote = getMacroNote(tfData);
+  const vote      = getTrendVote(tfData);
+  const dir       = upV > dnV ? 'UP' : 'DOWN';
+  const w         = weights || DEFAULT_WEIGHTS;
+  const sk1m      = d1m.stochRSI?.k ?? 50;
+  const bbPct     = d5m.bb?.pct     ?? 50;
+  const stBull    = d4h.supertrend?.bullish ?? d4h.macd.bullish;
 
-  // ─────────────────────────────────────────────────────────────
-  //  STEP 3: SPECIAL PATTERN DETECTORS (override normal scoring)
-  // ─────────────────────────────────────────────────────────────
+  // ── Factor 5: Multi-TF trend vote ────────────────────────────────────────
+  const trendPass  = dir === 'UP' ? vote.majority === 'BULLISH' : vote.majority === 'BEARISH';
+  const trendPct   = dir === 'UP' ? vote.pct : 100 - vote.pct;
+  const trendValue = `${vote.majority} (${trendPct}% TFs agree)`;
 
-  // ── DIP CATCHER ────────────────────────────────────────────
-  //  Logic: 1m RSI < 25 (extreme oversold) but macro says BULLISH
-  //         = beaten-down price in an uptrend  = high-prob bounce
-  if (rsi1m < RSI.OVERSOLD_EXTREME && macroTrend === 'BULLISH') {
-    return _signal('UP', AGGRESSIVE_SCORE, 'DIP_CATCHER', {
-      rsi1m, macroTrend,
-      note: `RSI at ${rsi1m.toFixed(1)} (extreme oversold) in BULLISH macro — bounce expected`,
-    });
-  }
+  // ── Build all 5 factors ────────────────────────────────────────────────────
+  const factors = [
+    {
+      name:   'Market Odds',
+      value:  dir === 'UP' ? `${upV}¢ UP` : `${dnV}¢ DOWN`,
+      pass:   dir === 'UP' ? upV >= 53 : dnV >= 53,
+      weight: w.odds,
+      tip:    dir === 'UP'
+        ? (upV  < 53 ? `Need 53¢+, have ${upV}¢`  : '✓ Strong odds')
+        : (dnV  < 53 ? `Need 53¢+, have ${dnV}¢`  : '✓ Strong odds'),
+    },
+    {
+      name:   'Price Buffer',
+      value:  threshV > 0 ? `${cur > threshV ? '+' : ''}$${(cur - threshV).toFixed(0)}` : 'No threshold set',
+      pass:   threshV > 0 ? (dir === 'UP' ? cur > threshV : cur < threshV) : false,
+      weight: w.buffer,
+      tip:    threshV === 0
+        ? 'Set Price to Beat'
+        : dir === 'UP'
+          ? (cur <= threshV ? `Price must be above $${threshV}` : '✓ Above threshold')
+          : (cur >= threshV ? `Price must be below $${threshV}` : '✓ Below threshold'),
+    },
+    {
+      name:   '5m MACD',
+      value:  `${d5m.macd.bullish ? '▲' : '▼'}${d5m.macd.line > 0 ? '+' : ''}${d5m.macd.line}`,
+      pass:   dir === 'UP' ? d5m.macd.bullish : !d5m.macd.bullish,
+      weight: w.macd5m,
+      tip:    `Hist: ${d5m.macd.hist} • Need ${dir === 'UP' ? 'bullish' : 'bearish'}`,
+    },
+    {
+      name:   '1m MACD',
+      value:  `${d1m.macd.bullish ? '▲' : '▼'}${d1m.macd.line > 0 ? '+' : ''}${d1m.macd.line}`,
+      pass:   dir === 'UP' ? d1m.macd.bullish : !d1m.macd.bullish,
+      weight: w.macd1m,
+      tip:    `Hist: ${d1m.macd.hist} • Need ${dir === 'UP' ? 'bullish' : 'bearish'}`,
+    },
+    {
+      name:   'Multi-TF Trend',
+      value:  trendValue,
+      pass:   trendPass,
+      weight: w.trend4h,
+      tip:    `4H: ${macro}${macroNote} • ${vote.bull.toFixed(1)} bull vs ${vote.bear.toFixed(1)} bear weight`,
+    },
+  ];
 
-  // ── MOUNTAIN CATCHER ───────────────────────────────────────
-  //  Logic: 1m RSI > 80 (extreme overbought) + price touches upper BB
-  //         + macro is BEARISH = exhaustion peak → high-prob reversal
-  const bbTouchUpper = price >= bb1m.upper * (1 - (1 - BB.BAND_TOUCH_RATIO) * 0.5);
+  const score = factors.filter(f => f.pass).length;
 
-  if (rsi1m > RSI.OVERBOUGHT_EXTREME && bbTouchUpper && macroTrend === 'BEARISH') {
-    return _signal('DOWN', AGGRESSIVE_SCORE, 'MOUNTAIN_CATCHER', {
-      rsi1m, macroTrend,
-      note: `RSI at ${rsi1m.toFixed(1)} (extreme overbought), touching upper BB in BEARISH macro — reversal expected`,
-    });
-  }
-
-  // ─────────────────────────────────────────────────────────────
-  //  STEP 4: STANDARD 5-FACTOR SCORING
-  // ─────────────────────────────────────────────────────────────
-
-  const factors = {};
-
-  // ── Factor 1: MACD 1m ──────────────────────────────────────
-  factors.macd = scoreMacd(macd1m);
-
-  // ── Factor 2: RSI 1m ───────────────────────────────────────
-  factors.rsi = scoreRsi(rsi1m);
-
-  // ── Factor 3: Bollinger Bands ──────────────────────────────
-  factors.bb = scoreBollingerBands(bb1m, price);
-
-  // ── Factor 4: Macro Trend ──────────────────────────────────
-  factors.macro = scoreMacro(macroTrend);
-
-  // ── Factor 5: Polymarket Odds ──────────────────────────────
-  factors.odds = scoreOdds(marketData);
-
-  // ── Tally UP and DOWN scores separately ───────────────────
-  let upScore   = 0;
-  let downScore = 0;
-
-  for (const f of Object.values(factors)) {
-    upScore   += Math.max(0,  f.upScore   ?? 0);
-    downScore += Math.max(0,  f.downScore ?? 0);
-  }
-
-  // ── Determine dominant direction ──────────────────────────
-  const dominantDir   = upScore > downScore ? 'UP' : downScore > upScore ? 'DOWN' : 'NONE';
-  const dominantScore = Math.max(upScore, downScore);
-
-  if (dominantScore < MIN_SIGNAL_SCORE || dominantDir === 'NONE') {
+  // ── NEUTRAL 4H + split vote: warn and skip ────────────────────────────────
+  if (macro === 'NEUTRAL' && vote.majority === 'NEUTRAL') {
     return {
-      direction:  'NONE',
-      score:      dominantScore,
-      confidence: 'NONE',
-      factors,
-      pattern:    'NO_SIGNAL',
-      blocked:    false,
-      macdSignal: _macdLabel(macd1m),
-      reason:     `Score ${dominantScore.toFixed(2)}/5 — below threshold of ${MIN_SIGNAL_SCORE}`,
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `⚠️ No clear trend — 4H NEUTRAL and TF vote split (${vote.pct}%). Wait for direction.`,
+      color: '#ffd700', skip: true,
     };
   }
 
+  // ── Anti-pattern: fighting a strong opposing macro ────────────────────────
+  // FIX: now SYMMETRIC — also blocks UP when 4H strongly BEARISH (was missing)
+  if (macro === 'BULLISH' && dir === 'DOWN' && dnV > 62 && vote.majority !== 'BEARISH') {
+    return {
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `❌ DOWN ${dnV}¢ vs BULLISH 4H — high risk reversal bet. TFs not confirming. Skip.`,
+      color: '#ff3366', skip: true,
+    };
+  }
+  if (macro === 'BEARISH' && dir === 'UP' && upV > 62 && vote.majority !== 'BULLISH') {
+    return {
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `❌ UP ${upV}¢ vs BEARISH 4H — high risk reversal bet. TFs not confirming. Skip.`,
+      color: '#ff3366', skip: true,
+    };
+  }
+
+  // ── Need 3+ confluences ───────────────────────────────────────────────────
+  if (score < 3) {
+    const failed = factors.filter(f => !f.pass).map(f => `${f.name}: ${f.tip}`).join(' | ');
+    return {
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `${score}/5 confluences — need 3+. Fix: ${failed}`,
+      color: '#ffd700', skip: false,
+    };
+  }
+
+  // ── Confidence calculation ────────────────────────────────────────────────
+  let conf = score === 3 ? 55 : score === 4 ? 62 : 67;
+
+  // FIX: was `(trendPct - 60) / 10` which goes NEGATIVE at exactly 60% (passing!)
+  // Now only adds — we already gated on trendPass, so trendPct >= 58 always
+  conf += Math.max(0, Math.round((trendPct - 58) / 8));
+
+  // Whale alignment
+  if (whaleSentiment?.label === (dir === 'UP' ? 'BULLISH' : 'BEARISH')) conf += 3;
+
+  // StochRSI adjustments
+  let stochNote = '';
+  if (sk1m <= 3  && dir === 'DOWN' && macro === 'BULLISH') { conf -= 12; stochNote = ' ⚡ StochRSI floor + bullish 4H — bounce risk.'; }
+  if (sk1m >= 97 && dir === 'UP')                          { conf -= 10; stochNote = ' 🚨 StochRSI ceiling — pullback risk.'; }
+
+  // FIX: was `sk1m <= 0 || sk1m >= 100` — basically impossible in real data
+  // Changed to <= 1 / >= 99 — these actually fire in practice
+  if (sk1m <= 1 || sk1m >= 99) {
+    return {
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `StochRSI at extreme (${sk1m}) — skip.${stochNote}`,
+      color: '#ffd700', skip: false,
+    };
+  }
+
+  if (dir === 'DOWN' && bbPct > 90) conf += 3;
+  if (dir === 'UP'   && bbPct < 10) conf += 3;
+  if ((dir === 'UP' && stBull) || (dir === 'DOWN' && !stBull)) conf += 2;
+
+  if (conf < 50) {
+    return {
+      result: 'NO BET', conf: 0, score, factors,
+      reason: `Confidence too low (${conf}%).${stochNote}`,
+      color: '#ffd700', skip: false,
+    };
+  }
+
+  // ── Spread signal modifier ────────────────────────────────────────────────
+  // TIGHT (<3¢):  market is confident, liquid → boost confidence
+  // NORMAL (3–8¢): neutral
+  // WIDE (>8¢):    uncertain / thin market → penalise confidence
+  // Imbalance: if crowd is heavily on the same side as our bet → small boost
+  let spreadNote = '';
+  if (spreadData) {
+    const sw = w.spreadSignal ?? 0.8;
+    if (spreadData.quality === 'TIGHT') {
+      conf += Math.round(3 * sw);
+      spreadNote = ` 📊 Tight spread (${spreadData.spreadCents}¢).`;
+    } else if (spreadData.quality === 'WIDE') {
+      conf -= Math.round(5 * sw);
+      spreadNote = ` ⚠️ Wide spread (${spreadData.spreadCents}¢) — thin market.`;
+    }
+    // Imbalance: crowd on our side = +2, against = -2
+    if (spreadData.imbalance !== undefined) {
+      const isBullBet = dir === 'UP';
+      if ((isBullBet && spreadData.imbalance > 20) || (!isBullBet && spreadData.imbalance < -20)) {
+        conf += Math.round(2 * sw);
+        spreadNote += ` Crowd ${isBullBet ? 'buying' : 'selling'} (${Math.abs(spreadData.imbalance).toFixed(0)}% imbalance).`;
+      } else if ((isBullBet && spreadData.imbalance < -20) || (!isBullBet && spreadData.imbalance > 20)) {
+        conf -= Math.round(2 * sw);
+        spreadNote += ` Crowd against bet (${Math.abs(spreadData.imbalance).toFixed(0)}% imbalance).`;
+      }
+    }
+  }
+
+  conf = Math.min(Math.round(conf), 74);
+  const color = dir === 'UP' ? '#00e5aa' : '#ff3366';
+
+  const features = {
+    odds:           upV > dnV ? 1 : -1,
+    buffer:         cur > (threshV || cur) ? 1 : -1,
+    macd5m:         d5m.macd.bullish ? 1 : -1,
+    macd1m:         d1m.macd.bullish ? 1 : -1,
+    trend4h:        macro === 'BULLISH' ? 1 : -1,
+    stochRSI:       sk1m > 50 ? 0.5 : -0.5,
+    macroStrength:  d4h.rsi > 55 ? 1 : -1,
+    whaleSentiment: whaleSentiment?.score || 0,
+    bbPosition:     dir === 'UP' ? (bbPct < 50 ? 0.5 : -0.5) : (bbPct > 50 ? 0.5 : -0.5),
+    supertrend:     stBull ? 1 : -1,
+    spreadSignal:   spreadData ? (spreadData.quality === 'TIGHT' ? 1 : spreadData.quality === 'WIDE' ? -1 : 0) : 0,
+  };
+
+  const whaleLine  = whaleSentiment?.label !== 'NEUTRAL' ? ` 🐋 Whales: ${whaleSentiment.label}.` : '';
+  const confLabel  = conf >= 65 ? 'HIGH' : conf >= 62 ? 'MODERATE' : 'LOW';
+
   return {
-    direction:  dominantDir,
-    score:      parseFloat(dominantScore.toFixed(2)),
-    confidence: scoreToConfidence(dominantScore),
-    factors,
-    pattern:    squeezeState.breakoutDetected ? 'SQUEEZE_BREAKOUT' : 'STANDARD',
-    blocked:    false,
-    macdSignal: _macdLabel(macd1m),
-    reason:     `${dominantDir} signal — score ${dominantScore.toFixed(2)}/5 (${scoreToConfidence(dominantScore)})`,
+    result: dir, conf, score, factors,
+    reason: `${score}/5 — ${confLabel} conf. 4H: ${macro}${macroNote}. ${vote.pct}% TFs ${vote.majority}.${stochNote}${whaleLine}${spreadNote}`,
+    color, features, skip: false,
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-//  INDIVIDUAL FACTOR SCORERS
-//  Each returns { upScore: 0–1, downScore: 0–1, note: string }
-// ─────────────────────────────────────────────────────────────
+// ── MARKET CLASSIFICATION ─────────────────────────────────────────────────────
+// FIX: now uses RSI + 4H MACD in classification, not just vote + whale
+export function classifyMarket(tfData, whaleSentiment) {
+  const vote  = getTrendVote(tfData);
+  const macro = getMacro(tfData);
+  const d4h   = tfData?.['4h'];
+  const d5m   = tfData?.['5m'];
+  if (!d5m) return { label: 'LOADING', score: 0 };
 
-/**
- * MACD Factor
- * • Strong bull histogram → upScore 1.0
- * • Bullish cross         → upScore 0.7
- * • Slight positive       → upScore 0.4
- * (mirrored for DOWN)
- */
-function scoreMacd(macd) {
-  const h = macd.histogram ?? 0;
-  const cross = macd.cross;
+  let score = 0;
 
-  let upScore = 0, downScore = 0, note = '';
+  // Vote strength (±2)
+  if (vote.pct >= 58) score += 2;
+  else if (vote.pct <= 42) score -= 2;
 
-  if (h > MACD.STRONG_BULL_THRESHOLD) {
-    upScore = 1.0; note = `Strong bull histogram (${h.toFixed(3)})`;
-  } else if (cross === 'BULL' || h > 0) {
-    upScore = cross === 'BULL' ? 0.7 : 0.4;
-    note = cross === 'BULL' ? 'Bullish MACD cross' : `Positive histogram (${h.toFixed(3)})`;
-  } else if (h < MACD.STRONG_BEAR_THRESHOLD) {
-    downScore = 1.0; note = `Strong bear histogram (${h.toFixed(3)})`;
-  } else if (cross === 'BEAR' || h < 0) {
-    downScore = cross === 'BEAR' ? 0.7 : 0.4;
-    note = cross === 'BEAR' ? 'Bearish MACD cross' : `Negative histogram (${h.toFixed(3)})`;
+  // 4H macro (±2) — strongest signal
+  if (macro === 'BULLISH') score += 2;
+  else if (macro === 'BEARISH') score -= 2;
+
+  // 4H RSI confirmation (±1)
+  if (d4h) {
+    if (d4h.rsi > 55 && macro === 'BULLISH') score += 1;
+    if (d4h.rsi < 45 && macro === 'BEARISH') score -= 1;
   }
 
-  return { upScore, downScore, note };
-}
+  // Whale (±1)
+  if (whaleSentiment?.label === 'BULLISH') score += 1;
+  if (whaleSentiment?.label === 'BEARISH') score -= 1;
 
-/**
- * RSI Factor
- * Oversold → upScore bias, Overbought → downScore bias
- */
-function scoreRsi(rsi) {
-  let upScore = 0, downScore = 0, note = '';
-
-  if (rsi <= RSI.OVERSOLD) {
-    // The more oversold, the stronger the UP bias
-    const intensity = Math.min(1.0, (RSI.OVERSOLD - rsi) / RSI.OVERSOLD);
-    upScore = 0.5 + intensity * 0.5;
-    note = `Oversold RSI (${rsi.toFixed(1)})`;
-  } else if (rsi >= RSI.OVERBOUGHT) {
-    const intensity = Math.min(1.0, (rsi - RSI.OVERBOUGHT) / (100 - RSI.OVERBOUGHT));
-    downScore = 0.5 + intensity * 0.5;
-    note = `Overbought RSI (${rsi.toFixed(1)})`;
-  } else {
-    // Neutral zone: slight momentum bias based on distance from 50
-    const dist = rsi - 50;
-    if (dist > 5)       { upScore   = 0.2; note = `RSI slightly bullish (${rsi.toFixed(1)})`; }
-    else if (dist < -5) { downScore = 0.2; note = `RSI slightly bearish (${rsi.toFixed(1)})`; }
-    else                { note = `RSI neutral (${rsi.toFixed(1)})`; }
-  }
-
-  return { upScore, downScore, note };
-}
-
-/**
- * Bollinger Band Factor
- * Price near lower band → UP score (oversold stretch)
- * Price near upper band → DOWN score (overbought stretch)
- */
-function scoreBollingerBands(bb, price) {
-  const range  = bb.upper - bb.lower;
-  if (range <= 0) return { upScore: 0, downScore: 0, note: 'BB range zero' };
-
-  // Position within the band: 0 = at lower, 1 = at upper
-  const position = (price - bb.lower) / range;
-
-  let upScore = 0, downScore = 0, note = '';
-
-  if (position <= (1 - BB.BAND_TOUCH_RATIO)) {
-    // Near lower band
-    upScore = BB.BAND_TOUCH_RATIO + (1 - BB.BAND_TOUCH_RATIO) * (1 - position / (1 - BB.BAND_TOUCH_RATIO));
-    upScore = Math.min(1.0, upScore);
-    note = `Price near lower BB (pos: ${(position * 100).toFixed(1)}%)`;
-  } else if (position >= BB.BAND_TOUCH_RATIO) {
-    // Near upper band
-    downScore = (position - BB.BAND_TOUCH_RATIO) / (1 - BB.BAND_TOUCH_RATIO);
-    downScore = Math.min(1.0, downScore);
-    note = `Price near upper BB (pos: ${(position * 100).toFixed(1)}%)`;
-  } else {
-    note = `Price mid-band (pos: ${(position * 100).toFixed(1)}%)`;
-  }
-
-  return { upScore, downScore, note };
-}
-
-/**
- * Macro Trend Factor (4H/1H EMA alignment)
- */
-function scoreMacro(macroTrend) {
-  if (macroTrend === 'BULLISH')         return { upScore: 1.0, downScore: 0,   note: 'Bullish macro (4H/1H)' };
-  if (macroTrend === 'BEARISH')         return { upScore: 0,   downScore: 1.0, note: 'Bearish macro (4H/1H)' };
-  if (macroTrend === 'WEAKLY_BULLISH')  return { upScore: 0.5, downScore: 0,   note: 'Weakly bullish macro' };
-  if (macroTrend === 'WEAKLY_BEARISH')  return { upScore: 0,   downScore: 0.5, note: 'Weakly bearish macro' };
-  return { upScore: 0, downScore: 0, note: 'Neutral macro' };
-}
-
-/**
- * Polymarket Odds Factor
- * Market crowd wisdom as a confirming/contrarian indicator.
- */
-function scoreOdds(marketData) {
-  const yes = marketData?.yes ?? 50;
-
-  if (yes >= ODDS.STRONG_ALIGNMENT) {
-    return { upScore: 1.0, downScore: 0, note: `Polymarket YES ${yes}% — crowd bullish` };
-  }
-  if (yes <= ODDS.STRONG_COUNTER) {
-    return { upScore: 0, downScore: 1.0, note: `Polymarket YES ${yes}% — crowd bearish` };
-  }
-
-  // Interpolate between 35 % and 65 %
-  const mid   = 50;
-  const dist  = yes - mid;
-  const score = Math.abs(dist) / (ODDS.STRONG_ALIGNMENT - mid) * 0.5;
-
-  return dist >= 0
-    ? { upScore: score,   downScore: 0,     note: `Polymarket lean UP (${yes}%)` }
-    : { upScore: 0,       downScore: score, note: `Polymarket lean DOWN (${yes}%)` };
-}
-
-// ─────────────────────────────────────────────────────────────
-//  MACRO TREND CALCULATOR
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Determine higher-timeframe trend from 4H and 1H EMA pairs.
- * Both timeframes must agree for a STRONG classification.
- *
- * @param {{ fast: number, slow: number }} ema4h
- * @param {{ fast: number, slow: number }} ema1h
- * @returns {'BULLISH'|'WEAKLY_BULLISH'|'NEUTRAL'|'WEAKLY_BEARISH'|'BEARISH'}
- */
-export function getMacroTrend(ema4h, ema1h) {
-  if (!ema4h?.fast || !ema4h?.slow || !ema1h?.fast || !ema1h?.slow) {
-    return 'NEUTRAL';
-  }
-
-  const diff4h = (ema4h.fast - ema4h.slow) / ema4h.slow;
-  const diff1h = (ema1h.fast - ema1h.slow) / ema1h.slow;
-
-  const bull4h = diff4h > MACRO.EMA_BULL_DIFF_PCT;
-  const bear4h = diff4h < MACRO.EMA_BEAR_DIFF_PCT;
-  const bull1h = diff1h > MACRO.EMA_BULL_DIFF_PCT;
-  const bear1h = diff1h < MACRO.EMA_BEAR_DIFF_PCT;
-
-  if (bull4h && bull1h) return 'BULLISH';
-  if (bear4h && bear1h) return 'BEARISH';
-  if (bull4h || bull1h) return 'WEAKLY_BULLISH';
-  if (bear4h || bear1h) return 'WEAKLY_BEARISH';
-  return 'NEUTRAL';
-}
-
-// ─────────────────────────────────────────────────────────────
-//  VOLATILITY SQUEEZE DETECTOR
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Detect if the Bollinger Bands are in a squeeze (consolidation).
- * A squeeze means the market is coiling — breakouts are violent
- * but direction is unpredictable → we block entries.
- *
- * We also detect if a breakout is underway (price outside band
- * by more than BREAKOUT_CONFIRMATION_RATIO of band width).
- *
- * @param {{ upper, lower, mid, width }} bb
- * @param {number} price
- * @param {number[]} widthHistory — recent BB widths (newest last)
- * @returns {{ inSqueeze, breakoutDetected, currentWidthPct }}
- */
-export function detectSqueeze(bb, price, widthHistory = []) {
-  const range = bb.upper - bb.lower;
-  const currentWidthPct = bb.mid > 0 ? range / bb.mid : 0;
-
-  const inSqueeze = currentWidthPct < BB.SQUEEZE_PCT_THRESHOLD;
-
-  // Breakout = price has closed outside the band
-  const outsideUpper = price > bb.upper;
-  const outsideLower = price < bb.lower;
-  const breakoutDetected =
-    (outsideUpper || outsideLower) &&
-    Math.abs(price - (outsideUpper ? bb.upper : bb.lower)) >
-      range * BB.BREAKOUT_CONFIRMATION_RATIO;
-
-  return { inSqueeze, breakoutDetected, currentWidthPct };
-}
-
-// ─────────────────────────────────────────────────────────────
-//  KELLY CRITERION POSITION SIZER
-// ─────────────────────────────────────────────────────────────
-
-/**
- * Compute recommended bet size as a fraction of bankroll
- * using the Kelly Criterion, capped for safety.
- *
- * Used by App.jsx to replace static betAmt.
- *
- * Kelly formula: f = (bp - q) / b
- *   b = net payout odds (e.g. Polymarket YES at 0.60 → b = (1-0.60)/0.60 ≈ 0.667)
- *   p = our estimated win probability from signal score
- *   q = 1 - p
- *
- * We map score → p:
- *   5/5 → p = 0.80  (very confident)
- *   4/5 → p = 0.70
- *   3/5 → p = 0.60  (minimum threshold)
- *   < 3 → don't trade
- *
- * @param {number} score       — signal score (0–5)
- * @param {number} oddsPrice   — current ask price (0–1), e.g. 0.55
- * @param {number} bankroll    — total USDC balance
- * @param {number} maxPct      — hard cap as decimal (default 0.05 = 5%)
- * @returns {number}           — dollar amount to bet (0 = don't trade)
- */
-export function calcKellyBetSize(score, oddsPrice, bankroll, maxPct = 0.05) {
-  if (score < MIN_SIGNAL_SCORE || oddsPrice <= 0 || oddsPrice >= 1) return 0;
-
-  // Map score to estimated win probability
-  const winProb = scoreToProbability(score);
-
-  // b = odds paid on a win (net profit per $ wagered at this price)
-  // If we buy at p=0.55 and win (resolves to $1), profit = 0.45 on 0.55 risk
-  const b = (1 - oddsPrice) / oddsPrice;
-  const p = winProb;
-  const q = 1 - p;
-
-  const kelly = (b * p - q) / b;
-
-  if (kelly <= 0) return 0; // negative Kelly = don't bet
-
-  // Apply half-Kelly for safety (full Kelly is very aggressive)
-  const halfKelly  = kelly * 0.5;
-  const cappedFrac = Math.min(halfKelly, maxPct);
-
-  return parseFloat((bankroll * cappedFrac).toFixed(2));
-}
-
-// ─────────────────────────────────────────────────────────────
-//  UTILITY FUNCTIONS
-// ─────────────────────────────────────────────────────────────
-
-function scoreToProbability(score) {
-  if (score >= 5.0) return 0.82;
-  if (score >= 4.5) return 0.76;
-  if (score >= 4.0) return 0.70;
-  if (score >= 3.5) return 0.65;
-  if (score >= 3.0) return 0.60;
-  return 0.50;
-}
-
-export function scoreToConfidence(score) {
-  if (score >= AGGRESSIVE_SCORE) return 'AGGRESSIVE';
-  if (score >= 4.0)              return 'STRONG';
-  if (score >= 3.0)              return 'MODERATE';
-  if (score >= 2.0)              return 'WEAK';
-  return 'NONE';
-}
-
-function _macdLabel(macd) {
-  if (!macd) return 'NEUTRAL';
-  if (macd.histogram > 0 || macd.cross === 'BULL') return 'BULLISH';
-  if (macd.histogram < 0 || macd.cross === 'BEAR') return 'BEARISH';
-  return 'NEUTRAL';
-}
-
-function _signal(direction, score, pattern, meta = {}) {
   return {
-    direction,
+    label:   score >= 3 ? 'BULLISH' : score <= -3 ? 'BEARISH' : 'NEUTRAL',
     score,
-    confidence: scoreToConfidence(score),
-    factors:    {},
-    pattern,
-    blocked:    false,
-    macdSignal: 'NEUTRAL',
-    reason:     meta.note ?? pattern,
-    meta,
+    votePct: vote.pct,
   };
 }
 
-function _blocked(pattern, reason) {
-  return {
-    direction:  'NONE',
-    score:      0,
-    confidence: 'NONE',
-    factors:    {},
-    pattern,
-    blocked:    true,
-    macdSignal: 'NEUTRAL',
-    reason,
-  };
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function nobet(reason, color, factors) {
+  return { result: 'NO BET', conf: 0, score: 0, factors, reason, color, skip: true };
+}
+function pending(reason) {
+  return { result: '---', conf: 0, score: 0, factors: [], reason, color: '#303060', skip: false };
 }
