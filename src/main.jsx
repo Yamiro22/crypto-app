@@ -1,10 +1,10 @@
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
+import React from 'react'
+import ReactDOM from 'react-dom/client'
 import App from './App.jsx'
+import './index.css'
 
-createRoot(document.getElementById('root')).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
+// StrictMode removed — it double-invokes effects in dev which breaks
+// long-lived WebSocket connections (closes them mid-handshake).
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <App />
 )

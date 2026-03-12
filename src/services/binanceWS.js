@@ -1,6 +1,5 @@
 // ─── BINANCE WEBSOCKET STREAM ─────────────────────────────────────────────────
 // Real-time BTC price + trade stream via WebSocket
-
 let ws = null;
 let reconnectTimer = null;
 let isRunning = false;
@@ -20,11 +19,11 @@ function notifyAll(data) {
 }
 
 function startStream() {
-  if (ws && ws.readyState === WebSocket.OPEN) return;
+  // ── Guard: don't open if already open or connecting ──────────────────────
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
   isRunning = true;
 
-  // Binance trade stream + miniTicker combined stream
-  // Uses Vite proxy (/binance-ws → wss://stream.binance.com:9443) to avoid CORS/WS blocks
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const streamUrl = `${wsProtocol}//${window.location.host}/binance-ws/stream?streams=btcusdt@trade/btcusdt@miniTicker`;
 
@@ -44,15 +43,15 @@ function startStream() {
 
         if (stream.includes('trade')) {
           notifyAll({
-            type: 'price',
+            type:  'price',
             price: parseFloat(data.p),
             qty:   parseFloat(data.q),
             time:  data.T,
-            isBuy: !data.m, // maker side = sell side, so !m = buyer
+            isBuy: !data.m,
           });
         } else if (stream.includes('miniTicker') || data.e === '24hrMiniTicker') {
           notifyAll({
-            type: 'ticker',
+            type:      'ticker',
             price:     parseFloat(data.c),
             open24h:   parseFloat(data.o),
             high24h:   parseFloat(data.h),
@@ -66,7 +65,7 @@ function startStream() {
       }
     };
 
-    ws.onerror = (e) => {
+    ws.onerror = () => {
       console.warn('[BinanceWS] error — falling back to polling');
       notifyAll({ type: 'status', connected: false, error: true });
     };
@@ -74,22 +73,36 @@ function startStream() {
     ws.onclose = () => {
       console.log('[BinanceWS] disconnected');
       notifyAll({ type: 'status', connected: false });
+      ws = null;
+      // ── Reconnect after 5s if still supposed to be running ──────────────
       if (isRunning) {
         reconnectTimer = setTimeout(() => startStream(), 5000);
       }
     };
+
   } catch (e) {
     console.warn('[BinanceWS] WebSocket unavailable:', e.message);
     notifyAll({ type: 'status', connected: false, error: true });
+    // Retry after 5s
+    if (isRunning) {
+      reconnectTimer = setTimeout(() => startStream(), 5000);
+    }
   }
 }
 
 function stopStream() {
   isRunning = false;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   if (ws) {
     ws.onclose = null;
-    ws.close();
+    // ── If still connecting, wait for open then close ─────────────────────
+    // Calling ws.close() during CONNECTING state causes the browser error.
+    if (ws.readyState === WebSocket.CONNECTING) {
+      ws.onopen = () => { ws.close(); };
+    } else {
+      ws.close();
+    }
     ws = null;
   }
 }
