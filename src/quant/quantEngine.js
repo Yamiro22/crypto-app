@@ -44,6 +44,7 @@ export function runQuantEngine({
   dnOdds,
   liquidityUSDC,
   balance = 100,
+  historicalBets = 0,  // total resolved bets — used for Kelly prior blending
   options = {},
 }) {
   // ── Guard: need basic data ────────────────────────────────────────────────
@@ -94,6 +95,7 @@ export function runQuantEngine({
         upOdds:  upOddsNum,
         dnOdds:  dnOddsNum,
         balance,
+        historicalBets,
         options,
       })
     : null;

@@ -85,6 +85,15 @@ export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresh
   if (!upV && !dnV) return pending('Enter Polymarket odds — click 📊 Smart Fill or type manually.');
   if (upV >= 48 && upV <= 52) return nobet('⚖️ Coin flip 48–52¢ — no edge.', '#ffd700', []);
 
+  // Odds ceiling: if favored side is >62¢, market is too confident — we can't beat it.
+  // At 72¢ we need 72% accuracy; bot's observed rate is 44% → guaranteed negative EV.
+  // Only bet in the 53–62¢ range where the edge requirement is achievable.
+  const favoredOdds = Math.max(upV, dnV);
+  if (favoredOdds > 62) {
+    const dir2 = upV > dnV ? 'UP' : 'DOWN';
+    return nobet(`🚫 Odds too high — ${dir2} at ${favoredOdds}¢ needs ${favoredOdds}% accuracy (sweet spot: 53–62¢).`, '#ff3366', []);
+  }
+
   // Buffer skip — behaviour depends on threshold source:
   // 'real'      = from Polymarket API → hard skip <$10 (real money threshold matters)
   // 'smartfill' = estimated from chart → only warn, never hard skip (it's just an estimate)
@@ -126,13 +135,17 @@ export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresh
     {
       name:   'Price Buffer',
       value:  threshV > 0 ? `${cur > threshV ? '+' : ''}$${(cur - threshV).toFixed(0)}` : 'No threshold set',
-      pass:   threshV > 0 ? (dir === 'UP' ? cur > threshV : cur < threshV) : false,
+      // Buffer logic: UP bet passes if price is within $50 BELOW threshold OR above it
+      //              DOWN bet passes if price is within $50 ABOVE threshold OR below it
+      // This captures "price is close enough to move through threshold by expiry"
+      // Hard skip (<$10) is handled above; here we allow a $50 proximity zone.
+      pass:   threshV > 0 ? (dir === 'UP' ? cur > threshV - 50 : cur < threshV + 50) : false,
       weight: w.buffer,
       tip:    threshV === 0
         ? 'Set Price to Beat'
         : dir === 'UP'
-          ? (cur <= threshV ? `Price must be above $${threshV}` : '✓ Above threshold')
-          : (cur >= threshV ? `Price must be below $${threshV}` : '✓ Below threshold'),
+          ? (cur <= threshV - 50 ? `Price too far below — need within $50 of $${threshV}` : cur > threshV ? `✓ $${(cur-threshV).toFixed(0)} above threshold` : `✓ Within $50 of threshold ($${(threshV-cur).toFixed(0)} gap)`)
+          : (cur >= threshV + 50 ? `Price too far above — need within $50 of $${threshV}` : cur < threshV ? `✓ $${(threshV-cur).toFixed(0)} below threshold` : `✓ Within $50 of threshold ($${(cur-threshV).toFixed(0)} gap)`),
     },
     {
       name:   '5m MACD',

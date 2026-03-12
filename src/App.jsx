@@ -1,6 +1,6 @@
 // ─── BABYDOGE BTC ORACLE v3 — FULL INTELLIGENCE TERMINAL ────────────────────
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line, BarChart, Bar, ReferenceLine } from 'recharts';
 import { fetchAllTimeframes, fetch24hrStats } from './services/binanceApi.js';
 import { subscribePriceStream } from './services/binanceWS.js';
 import { fetchActiveBTCMarket } from './services/polymarketApi.js';
@@ -332,6 +332,12 @@ export default function App() {
 
   // Keep polyRoundRef in sync for hedge engine (avoids stale closure)
   useEffect(() => { polyRoundRef.current = polyRound; }, [polyRound]);
+  // Fix 3: Auto-sync threshold from fresh Polymarket data into autoRef
+  useEffect(() => {
+    if (polyRound?.threshold) {
+      autoRef.current.threshold = polyRound.threshold.toString();
+    }
+  }, [polyRound]);
 
   // Helper: seconds until next 5-min boundary
   const secsToNextRound = () => {
@@ -389,7 +395,7 @@ export default function App() {
       setWeights(w => updateWeights(w, bet.features, won));
       setAiLog(p => [{ time: new Date().toLocaleTimeString(), won, direction: bet.direction, conf: bet.conf, note: won ? '✅ Auto-bet WIN — weights reinforced' : '🔄 Auto-bet LOSS — weights adjusted' }, ...p.slice(0, 19)]);
     }
-    setBetHistory(p => [...p, { correct: won, pnl: won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount, auto: true }]);
+    setBetHistory(p => [...p, { correct: won, pnl: won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount, auto: true, ts: Date.now(), bal: +(balance + (won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount)).toFixed(2) }]);
     setPendingBet(null);
     setBotRoundBet(null);
     return won;
@@ -400,12 +406,22 @@ export default function App() {
     if (!autoBot) { setRoundTimer(null); setBotStatus('idle'); return; }
 
     const startBal = autoRef.current.balance;
-    autoRef.current.sessionStartBal = startBal;
-    autoRef.current.consecLosses = 0;
-    autoRef.current.paused = false;
+    // Fix 6: Only reset session data on a true new session (not a quick restart)
+    const now = Date.now();
+    const lastStop = autoRef.current.lastStopTime || 0;
+    const isQuickRestart = (now - lastStop) < 90000; // within 90 seconds = quick restart
+    if (!isQuickRestart) {
+      autoRef.current.sessionStartBal = startBal;
+      autoRef.current.consecLosses = 0;
+      autoRef.current.paused = false;
+      autoRef.current.consecutiveVetos = 0;
+      autoRef.current.consecutiveRuleSkips = 0;
+      setSessionStats({ wins:0, losses:0, startBal, skipReasons:{rule:0,bayes:0,lmsr:0,balance:0,circuit:0} });
+      botLog_add('🤖 Auto-Bot STARTED — new session', 'start');
+    } else {
+      botLog_add(`🔄 Auto-Bot RESUMED — continuing session (${autoRef.current.consecLosses}L streak preserved)`, 'start');
+    }
     setBotStatus('watching');
-    botLog_add('🤖 Auto-Bot STARTED — watching for 5-min round boundaries', 'start');
-    setSessionStats({ wins:0, losses:0, startBal, skipReasons:{rule:0,bayes:0,lmsr:0,balance:0,circuit:0} });
 
     const tick = setInterval(() => {
       const secs = secsToNextRound();
@@ -420,16 +436,27 @@ export default function App() {
         ref.bettedThisRound  = false;
       }
 
-      // ── 55–65s before round ends: fetch fresh data ──────────────────────
-      if (secs <= 65 && secs >= 55 && !ref.fetchedThisRound) {
+      // ── 80–90s before round ends: fetch fresh data early (Fix: was 55-65) ──
+      if (secs <= 90 && secs >= 80 && !ref.fetchedThisRound) {
         ref.fetchedThisRound = true;
         setBotStatus('analyzing');
-        botLog_add(`⏱ Round ends in ~${secs}s — fetching fresh data...`, 'info');
+        botLog_add(`⏱ Round ends in ~${secs}s — fetching fresh data (40s buffer)...`, 'info');
         fetchData();
+        // Force-refresh Polymarket threshold directly into autoRef (bypasses state→ref delay)
+        fetchActiveBTCMarket().then(market => {
+          if (market?.threshold) {
+            const newThresh = market.threshold.toString();
+            if (newThresh !== autoRef.current.threshold) {
+              botLog_add(`🔄 Threshold updated: $${autoRef.current.threshold} → $${newThresh}`, 'info');
+            }
+            autoRef.current.threshold = newThresh;
+            setPolyRound(market); // also update state for UI
+          }
+        }).catch(() => {/* non-fatal */});
       }
 
-      // ── 40–50s before: evaluate and bet ─────────────────────────────────
-      if (secs <= 50 && secs >= 40 && !ref.bettedThisRound && !ref.pendingBet) {
+      // ── 55–65s before: evaluate and bet (data now has 25s to arrive) ────
+      if (secs <= 65 && secs >= 55 && !ref.bettedThisRound && !ref.pendingBet) {
         ref.bettedThisRound = true;
         const { pred: curPred, price: curPrice, threshold: curThresh, balance: curBalance,
                 betAmt: curBetAmt, botCfg: cfg, upOdds: curUp, dnOdds: curDn,
@@ -469,17 +496,88 @@ export default function App() {
           return;
         }
 
-        // ── [1] Rule engine gate (min score + min confidence) ──────────────
+        // ── [5] Rule engine gate — with Quant override path ─────────────────
         const minScore = cfg.minScore || 3;
         const minConf  = cfg.minConf  || 55;
-        if (!curPred || !['UP', 'DOWN'].includes(curPred.result) || curPred.score < minScore || curPred.conf < minConf) {
-          const reason = !curPred ? 'No signal' : curPred.result === 'NO BET' ? curPred.reason : `Score ${curPred.score}/${minScore} or conf ${curPred.conf}%<${minConf}%`;
-          botLog_add(`⏭ RULE SKIP — ${reason}`, 'skip');
-          setSkippedCount(n => n + 1);
-          setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, rule: s.skipReasons.rule + 1 } }));
-          setBotStatus('watching');
-          return;
+        const ruleOk   = ['UP','DOWN'].includes(curPred?.result) && curPred.score >= minScore && curPred.conf >= minConf;
+
+        if (!ruleOk) {
+          // Track consecutive rule skips — relaxes Quant threshold after 4+ rounds stuck
+          const ruleSkipCount = (autoRef.current.consecutiveRuleSkips || 0) + 1;
+          autoRef.current.consecutiveRuleSkips = ruleSkipCount;
+
+          // Fix 5 (upgraded): Before hard-skipping, check if Quant Engine agrees on direction.
+          // Standard: Bayes≥80% + LMSR tradeable → override.
+          // Relaxed (after 4+ skip streak): Bayes≥70% + no VETO → override at 40% size.
+          let quantOverride = false;
+          let overrideAmt = curBetAmt || 5;
+          let overrideNote = '';
+          if (curPred && ['UP','DOWN'].includes(curPred.result)) {
+            try {
+              const qCheck = runQuantEngine({
+                signalResult: curPred, tfData: curTf, price: curPrice,
+                whaleSentiment: curWhale, oddsHistory: curOddsHist,
+                spreadData: curSpread, upOdds: curUp, dnOdds: curDn,
+                liquidityUSDC: 100000, balance: curBalance,
+                historicalBets: betHistory.length,
+                options: { kellyFrac: 0.25, minEV: 0.04 },
+              });
+              const b = qCheck?.bayesian;
+              const isVeto = qCheck?.combined?.strength === 'VETO';
+              const lmsrTradeable = qCheck?.lmsr?.tradeable === true;
+
+              // Standard override: Bayes≥80% same direction + LMSR tradeable
+              const stdBayesThreshold = 0.80;
+              const bayesStrongStd = b && (
+                (curPred.result === 'UP'   && b.probUp   >= stdBayesThreshold) ||
+                (curPred.result === 'DOWN' && b.probDown >= stdBayesThreshold)
+              );
+              if (bayesStrongStd && lmsrTradeable && !isVeto) {
+                quantOverride = true;
+                if (cfg.useKelly && qCheck?.decision?.size > 0) {
+                  overrideAmt = Math.max(1, Math.round(Math.min(qCheck.decision.size * 0.6, curBalance * 0.08) * 2) / 2);
+                }
+                overrideNote = ` | QUANT OVERRIDE: Bayes ${(b.probUp*100).toFixed(0)}%UP/${(b.probDown*100).toFixed(0)}%DOWN + LMSR agree`;
+                botLog_add(`⚡ QUANT OVERRIDE — rule ${curPred.score}/${minScore} weak but Bayes ${Math.round((curPred.result==='UP'?b.probUp:b.probDown)*100)}% + LMSR agree → $${overrideAmt}`, 'bet');
+              }
+
+              // Relaxed override: after 4+ skip rounds stuck, lower threshold to 70% + no VETO
+              if (!quantOverride && ruleSkipCount >= 4 && !isVeto && b) {
+                const relaxedThreshold = 0.70;
+                const bayesRelaxed =
+                  (curPred.result === 'UP'   && b.probUp   >= relaxedThreshold) ||
+                  (curPred.result === 'DOWN' && b.probDown >= relaxedThreshold);
+                if (bayesRelaxed) {
+                  quantOverride = true;
+                  // Even more conservative: 40% of base bet, max 5% balance
+                  overrideAmt = Math.max(1, Math.round(Math.min((curBetAmt || 5) * 0.4, curBalance * 0.05) * 2) / 2);
+                  const bayesPct = Math.round((curPred.result==='UP'?b.probUp:b.probDown)*100);
+                  overrideNote = ` | RELAXED OVERRIDE after ${ruleSkipCount} skips: Bayes ${bayesPct}%`;
+                  botLog_add(`⚡ RELAXED OVERRIDE — ${ruleSkipCount} rule-skip streak, Bayes ${bayesPct}% ${curPred.result} agrees → betting cautiously $${overrideAmt}`, 'bet');
+                }
+              }
+            } catch(e) { /* non-fatal */ }
+          }
+
+          if (!quantOverride) {
+            const skipFactors = curPred?.factors?.filter(f => !f.pass).map(f => `${f.name}: ${f.tip}`).join(' | ') || '';
+            const baseReason = !curPred ? 'No signal' : curPred.result === 'NO BET' ? curPred.reason : `${curPred.score}/${minScore} confluences — need ${minScore}+`;
+            const streakNote = ruleSkipCount >= 4 ? ` [skip #${ruleSkipCount}]` : '';
+            botLog_add(`⏭ RULE SKIP — ${baseReason}${skipFactors ? '. Fix: ' + skipFactors : ''}${streakNote}`, 'skip');
+            setSkippedCount(n => n + 1);
+            setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, rule: s.skipReasons.rule + 1 } }));
+            setBotStatus('watching');
+            return;
+          }
+          // Quant override path — place the bet directly (skip main quant block below)
+          autoRef.current.consecutiveRuleSkips = 0;
+          setBotStatus('betting');
+          const overrideBet = botPlaceBet(curPred, overrideAmt, curPrice, curThresh);
+          if (overrideBet) botLog_add(`🎯 BET ${curPred.result} @ ${overrideBet.odds}¢ — conf ${curPred.conf}% (${curPred.score}/5) — $${overrideAmt}${overrideNote}`, 'bet');
+          return; // done for this round
         }
+        // Reset skip streak counter when rule passes
+        autoRef.current.consecutiveRuleSkips = 0;
 
         // ── [1] Quant Engine: Bayesian + LMSR evaluation ───────────────────
         let finalAmt = baseAmt;
@@ -496,19 +594,50 @@ export default function App() {
             dnOdds: curDn,
             liquidityUSDC: 100000,
             balance: curBalance,
+            historicalBets: betHistory.length,
             options: { kellyFrac: 0.25, minEV: 0.04 },
           });
 
-          // [2] Bayesian veto — if Bayes strongly disagrees, skip
+          // [2] Bayesian veto — Bayes strongly disagrees with rule direction
           if (quant?.combined?.strength === 'VETO') {
-            botLog_add(`🧠 BAYES VETO — ${quant.combined.reason}`, 'skip');
+            const b = quant.bayesian;
+            const vetoCount = (autoRef.current.consecutiveVetos || 0) + 1;
+            autoRef.current.consecutiveVetos = vetoCount;
+
+            // ── BAYES FLIP OVERRIDE ──────────────────────────────────────────
+            const flipThreshold = vetoCount >= 4 ? 0.75 : 0.85;
+            const ruleDir  = curPred?.result;
+            const bayesDir = b?.probDown >= flipThreshold ? 'DOWN' : b?.probUp >= flipThreshold ? 'UP' : null;
+            const isOpposite = bayesDir && ruleDir && bayesDir !== ruleDir;
+            const lmsrAgreesBayes = quant?.lmsr?.bestSide === bayesDir || !quant?.lmsr?.bestSide;
+
+            if (isOpposite && lmsrAgreesBayes && b) {
+              const flipConf = Math.round(Math.abs((bayesDir === 'DOWN' ? b.probDown : b.probUp) - 0.5) * 200);
+              const flipPred = { ...curPred, result: bayesDir, conf: flipConf };
+              // Fix 3: DOWN bets capped at 50% size, max 5% balance
+              let flipAmt = Math.max(1, Math.round(Math.min(
+                (curBetAmt || 5) * 0.5, curBalance * 0.06
+              ) * 2) / 2);
+              if (bayesDir === 'DOWN') flipAmt = Math.max(1, Math.round(Math.min(flipAmt * 0.5, curBalance * 0.05) * 2) / 2);
+              const bayesPct = Math.round((bayesDir === 'DOWN' ? b.probDown : b.probUp) * 100);
+              botLog_add(`🔄 BAYES FLIP — rule→${ruleDir} but Bayes ${bayesPct}%${bayesDir} (${vetoCount} veto streak, threshold ${Math.round(flipThreshold*100)}%) → flipping to ${bayesDir} $${flipAmt}`, 'bet');
+              setBotStatus('betting');
+              const flipBet = botPlaceBet(flipPred, flipAmt, curPrice, curThresh);
+              if (flipBet) botLog_add(`🎯 BET ${bayesDir} @ ${flipBet.odds}¢ — Bayes-flip conf ${flipConf}% — $${flipAmt}`, 'bet');
+              autoRef.current.consecutiveVetos = 0;
+              return;
+            }
+
+            const streakWarn = vetoCount >= 4 ? ` ⚠️ ${vetoCount}-round veto streak — market may be trending ${b?.probDown > 0.5 ? 'DOWN' : 'UP'}` : '';
+            botLog_add(`🧠 BAYES VETO — ${quant.combined.reason}${streakWarn}`, 'skip');
             setSkippedCount(n => n + 1);
             setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, bayes: s.skipReasons.bayes + 1 } }));
             setBotStatus('watching');
             return;
           }
+          autoRef.current.consecutiveVetos = 0;
 
-          // [2] LMSR edge gate — skip if no positive EV
+          // [2] LMSR edge gate
           if (curUp > 0 && curDn > 0 && quant?.lmsr && !quant.lmsr.tradeable && quant.lmsr.inefficiency?.quality === 'NONE') {
             botLog_add(`📐 LMSR SKIP — no market edge (model ≈ market price)`, 'skip');
             setSkippedCount(n => n + 1);
@@ -517,11 +646,26 @@ export default function App() {
             return;
           }
 
-          // [2] Kelly sizing — override fixed bet if enabled
+          // [3] Kelly sizing — prior-blended, max 10% balance
           if (cfg.useKelly && quant?.decision?.size > 0) {
-            finalAmt = Math.min(quant.decision.size, curBalance * 0.12);
-            finalAmt = Math.max(1, Math.round(finalAmt * 2) / 2); // round to 50¢
-            quantNote = ` | Kelly $${finalAmt} | EV:+${quant.decision.ev?.evPct}¢`;
+            finalAmt = Math.min(quant.decision.size, curBalance * 0.10);
+            finalAmt = Math.max(1, Math.round(finalAmt * 2) / 2);
+            const blendNote = betHistory.length < 30 ? ` [prior-blend ${betHistory.length}bets]` : '';
+            quantNote = ` | Kelly $${finalAmt} | EV:+${quant.decision.ev?.evPct}¢${blendNote}`;
+          }
+
+          // Fix 3: DOWN direction — cap at 50% of calculated size until we have DOWN accuracy data
+          // Currently 0/2 on DOWN bets; don't size them the same as UP until proven
+          if (curPred.result === 'DOWN') {
+            const downBets = betHistory.filter(b => b.dir === 'DOWN' || b.direction === 'DOWN');
+            const downWins = downBets.filter(b => b.correct).length;
+            const downWR = downBets.length >= 5 ? downWins / downBets.length : null;
+            // Cap DOWN at 50% unless we have 5+ DOWN bets with ≥55% win rate
+            if (!downWR || downWR < 0.55) {
+              const prevAmt = finalAmt;
+              finalAmt = Math.max(1, Math.round((finalAmt * 0.5) * 2) / 2);
+              if (prevAmt !== finalAmt) quantNote += ` | ↓50% DOWN cap (${downBets.length} DOWN bets, WR:${downWR ? Math.round(downWR*100)+'%' : 'N/A'})`;
+            }
           }
 
           // Log Bayesian reading
@@ -531,7 +675,6 @@ export default function App() {
           }
         } catch(e) {
           console.warn('[Bot] Quant engine error:', e.message);
-          // Non-fatal — fall through with base bet
         }
 
         // ── Place bet ──────────────────────────────────────────────────────
@@ -582,7 +725,7 @@ export default function App() {
       }
     }, 1000);
 
-    return () => { clearInterval(tick); setBotStatus('idle'); };
+    return () => { clearInterval(tick); setBotStatus('idle'); autoRef.current.lastStopTime = Date.now(); };
   }, [autoBot, botPlaceBet, botResolveBet, fetchData]);
 
   // ─── HEDGE / ARB ENGINE ──────────────────────────────────────────────────
@@ -747,7 +890,7 @@ export default function App() {
       setWeights(nw);
       setAiLog(p => [{ time:new Date().toLocaleTimeString(), won, direction:bet.direction, conf:bet.conf, note:won?'✅ Weights reinforced':'🔄 Weights adjusted' }, ...p.slice(0,19)]);
     }
-    setBetHistory(p => [...p, { correct:won, pnl: won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount }]);
+    setBetHistory(p => { const pnl = won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount; return [...p, { correct:won, pnl, auto: false, ts: Date.now(), bal: null }]; });
     setPendingBet(null);
   };
 
@@ -1438,12 +1581,19 @@ export default function App() {
                             <div style={{ fontSize:8, color:'#252550', fontWeight:800 }}>CONF · SCORE</div>
                             <div style={{ fontFamily:"'Fredoka One'", fontSize:15, color:'#e0e0ff' }}>{pred.conf}% · {pred.score}/5</div>
                           </div>
-                          {wouldBet && botCfg.useKelly && (
-                            <div style={{ textAlign:'center' }}>
-                              <div style={{ fontSize:7, color:'#252550', fontWeight:800 }}>KELLY</div>
-                              <div style={{ fontSize:11, color:'#c44dff', fontWeight:800 }}>${Math.max(1,Math.round(balance*0.035))}</div>
-                            </div>
-                          )}
+                          {wouldBet && botCfg.useKelly && (() => {
+                            // Fix 2: real Kelly estimate from EV, not balance*0.035
+                            try {
+                              const qPrev = runQuantEngine({ signalResult:pred, tfData, price, whaleSentiment, oddsHistory, spreadData, upOdds:parseFloat(upOdds)||0, dnOdds:parseFloat(dnOdds)||0, liquidityUSDC:100000, balance, options:{kellyFrac:0.25,minEV:0.04} });
+                              const sz = qPrev?.decision?.size > 0 ? Math.max(1, Math.round(Math.min(qPrev.decision.size, balance*0.12) * 2)/2) : null;
+                              return sz ? (
+                                <div style={{ textAlign:'center' }}>
+                                  <div style={{ fontSize:7, color:'#252550', fontWeight:800 }}>KELLY</div>
+                                  <div style={{ fontSize:11, color:'#c44dff', fontWeight:800 }}>${sz}</div>
+                                </div>
+                              ) : null;
+                            } catch { return null; }
+                          })()}
                         </div>
                         <div style={{ fontSize:9, color:'#3a3a6a', lineHeight:1.5, marginBottom:6 }}>{pred.reason}</div>
                         {/* Gating checks */}
@@ -1459,7 +1609,7 @@ export default function App() {
                           ))}
                         </div>
                         <div style={{ padding:'6px 9px', borderRadius:7, border:`1px solid ${wouldBet?'rgba(0,229,170,.2)':'rgba(255,213,0,.12)'}`, background:wouldBet?'rgba(0,229,170,.06)':'rgba(255,213,0,.04)', fontSize:9, color:wouldBet?'#00e5aa':'#ffd700', fontWeight:800 }}>
-                          {wouldBet ? `✅ BET ${pred.result} — passes all gate checks` : '⏭ SKIP — fails gate checks above'}
+                          {wouldBet ? `✅ BET ${pred.result} — passes all gate checks` : '⏭ RULE SKIP — Quant override possible if Bayes≥80% + LMSR'}
                         </div>
                       </div>
                     );
@@ -1569,12 +1719,12 @@ export default function App() {
                       <div className="bar-fill" style={{ width:`${Math.min(100, ((300-roundTimer)/300)*100)}%`, background: roundTimer<=45?'#ffd700':roundTimer<=60?'#ff9d00':'#00e5aa', height:'100%', transition:'width 1s linear' }}/>
                     </div>
                     <div style={{ fontSize:8, color:'#252550', marginTop:3 }}>
-                      {roundTimer > 65 ? (
+                      {roundTimer > 90 ? (
                         pred?.result && ['UP','DOWN'].includes(pred.result)
                           ? <span>👁 Watching — signal: <span style={{color:pred.result==='UP'?'#00e5aa':'#ff3366',fontWeight:800}}>{pred.result}</span> {pred.conf}% ({pred.score}/5)</span>
                           : <span>👁 Watching — no signal yet</span>
-                      ) : roundTimer > 50 ? '⚡ Fetching fresh data + running Quant Engine...'
-                        : roundTimer > 5  ? '🎯 Signal + Bayesian evaluated — bet placed or skipped'
+                      ) : roundTimer > 65 ? '⚡ Fetching data — 25s buffer for signal to settle...'
+                        : roundTimer > 5  ? '🎯 Evaluating + Bayesian gate — bet placed or skipped'
                         : '🔔 Resolving round + updating AI weights...'}
                     </div>
                   </div>
@@ -1853,87 +2003,160 @@ export default function App() {
           AI LAB TAB
       ══════════════════════════════════════════════════════ */}
       {activeTab==='ai' && (
-        <div style={{ flex:1, padding:8, display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
-          <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
-            <div className="card" style={{ padding:13 }}>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:14, marginBottom:4 }}>🧠 AI Learning Engine <span style={{ fontSize:9, color:'#00e5aa', fontWeight:800, background:'rgba(0,229,170,.08)', padding:'2px 7px', borderRadius:10, marginLeft:4 }}>💾 Auto-saved</span></div>
-              <div style={{ fontSize:10, color:'#3a3a6a', marginBottom:10, lineHeight:1.7 }}>Weights update automatically after each resolved paper bet. Correct predictions reinforce signals; incorrect predictions reduce their weight.</div>
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:7, marginBottom:10 }}>
-                {[{l:'Total Bets',v:betHistory.length,c:'#c44dff'},{l:'Win Rate',v:`${winRate}%`,c:winRate>=55?'#00e5aa':'#ff3366'},{l:'P&L',v:`${totalPnL>=0?'+':''}$${totalPnL.toFixed(2)}`,c:totalPnL>=0?'#00e5aa':'#ff3366'},{l:'Balance',v:`$${balance.toFixed(2)}`,c:'#ffd700'}].map((s,i)=>(
-                  <div key={i} style={{ background:'#050510', borderRadius:8, padding:'9px', textAlign:'center' }}>
-                    <div style={{ fontSize:8, color:'#252550', fontWeight:800, letterSpacing:1 }}>{s.l}</div>
-                    <div style={{ fontFamily:"'Fredoka One'", fontSize:18, color:s.c }}>{s.v}</div>
+        <div style={{ flex:1, padding:8, display:'flex', flexDirection:'column', gap:7, overflow:'hidden', minHeight:0 }}>
+
+          {/* ── ROW 1: Stats bar ── */}
+          <div className="card" style={{ padding:'10px 14px', flexShrink:0, display:'flex', alignItems:'center', gap:8, justifyContent:'space-between', flexWrap:'wrap' }}>
+            <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:14 }}>🧠 AI Learning Engine <span style={{ fontSize:9, color:'#00e5aa', fontWeight:800, background:'rgba(0,229,170,.08)', padding:'2px 7px', borderRadius:10, marginLeft:4 }}>💾 Auto-saved</span></div>
+            <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+              {(() => {
+                const autoBets = betHistory.filter(b=>b.auto);
+                const autoWins = autoBets.filter(b=>b.correct).length;
+                const autoWR   = autoBets.length ? Math.round(autoWins/autoBets.length*100) : 0;
+                const streak   = (() => { let s=0; for(let i=betHistory.length-1;i>=0;i--){ if(betHistory[i].correct){ if(s>=0)s++; else break; } else { if(s<=0)s--; else break; } } return s; })();
+                return [
+                  ['TOTAL', betHistory.length, '#c44dff'],
+                  ['WIN %', `${winRate}%`, winRate>=55?'#00e5aa':'#ff3366'],
+                  ['BOT W%', autoBets.length?`${autoWR}%`:'—', autoWR>=55?'#00e5aa':autoBets.length?'#ff3366':'#3a3a6a'],
+                  ['P&L', `${totalPnL>=0?'+':''}$${totalPnL.toFixed(2)}`, totalPnL>=0?'#00e5aa':'#ff3366'],
+                  ['BALANCE', `$${balance.toFixed(2)}`, '#ffd700'],
+                  ['STREAK', streak===0?'—':streak>0?`+${streak}W`:`${Math.abs(streak)}L`, streak>0?'#00e5aa':streak<0?'#ff3366':'#3a3a6a'],
+                ].map(([l,v,col])=>(
+                  <div key={l} style={{ background:'#050510', borderRadius:8, padding:'7px 12px', textAlign:'center', minWidth:56 }}>
+                    <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>{l}</div>
+                    <div style={{ fontFamily:"'Fredoka One'", fontSize:15, color:col, marginTop:1 }}>{v}</div>
+                  </div>
+                ));
+              })()}
+            </div>
+            <div style={{ display:'flex', gap:6 }}>
+              <button className="btn" onClick={()=>setWeights(DEFAULT_WEIGHTS)} style={{ background:'#08081e', color:'#252560', border:'1px solid #12122e', fontSize:9 }}>Reset Weights</button>
+              <button className="btn" onClick={()=>{ if(!window.confirm('Wipe ALL saved data?')) return; ['bd_weights','bd_balance','bd_betHistory','bd_paperBets','bd_aiLog','bd_pendingBet','bd_botCfg'].forEach(k=>localStorage.removeItem(k)); setWeights(DEFAULT_WEIGHTS); setBalance(100); setBetHistory([]); setPaperBets([]); setAiLog([]); setPendingBet(null); }} style={{ background:'rgba(255,51,102,.08)', color:'#ff3366', border:'1px solid #ff336633', fontSize:9 }}>🗑 Wipe All Data</button>
+              <button className="btn" onClick={()=>{
+                const NL = String.fromCharCode(10);
+                const header = 'Time,Direction,Conf,Score,PnL,Balance,Auto';
+                const rows = betHistory.map((b,i)=>{
+                  const ts = b.ts ? new Date(b.ts).toLocaleTimeString() : ('bet'+(i+1));
+                  const cumBal = betHistory.slice(0,i+1).reduce((a,x)=>a+(x.pnl||0),100).toFixed(2);
+                  const pnl = b.pnl != null ? b.pnl.toFixed(2) : '0';
+                  return [ts, b.direction||'?', b.conf||0, b.score||0, pnl, b.bal||cumBal, b.auto?'yes':'no'].join(',');
+                });
+                const csv = [header, ...rows].join(NL);
+                const a = document.createElement('a');
+                a.href = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv);
+                a.download = 'ai-lab-' + new Date().toISOString().slice(0,10) + '.csv';
+                a.click();
+              }} style={{ background:'rgba(0,229,170,.06)', color:'#00e5aa', border:'1px solid #00e5aa22', fontSize:9 }}>💾 Export CSV</button>
+            </div>
+          </div>
+
+          {/* ── ROW 2: P&L Curve — full width, fixed height ── */}
+          <div className="card" style={{ padding:'10px 14px', flexShrink:0, height:160 }}>
+            <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+              <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:13 }}>📊 P&L Curve</div>
+              {betHistory.length > 0 && (
+                <div style={{ display:'flex', gap:12, fontSize:8, color:'#3a3a6a' }}>
+                  <span>▲ <span style={{color:'#00e5aa'}}>{betHistory.filter(b=>b.correct).length}W</span></span>
+                  <span>▼ <span style={{color:'#ff3366'}}>{betHistory.filter(b=>!b.correct).length}L</span></span>
+                  <span>peak: <span style={{color:'#ffd700'}}>${Math.max(...betHistory.map((_,i)=>betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0))).toFixed(2)}</span></span>
+                </div>
+              )}
+            </div>
+            {betHistory.length < 2 ? (
+              <div style={{ height:110, display:'flex', alignItems:'center', justifyContent:'center', color:'#252550', fontSize:10 }}>Place 2+ bets to see curve</div>
+            ) : (() => {
+              const curveData = betHistory.map((b,i)=>{
+                const cumPnl = +betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0).toFixed(2);
+                const ts = b.ts ? new Date(b.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : `#${i+1}`;
+                return { i: i+1, pnl: cumPnl, ts, win: b.correct };
+              });
+              const minPnl = Math.min(0, ...curveData.map(d=>d.pnl));
+              const maxPnl = Math.max(0, ...curveData.map(d=>d.pnl));
+              const lineCol = curveData[curveData.length-1].pnl >= 0 ? '#00e5aa' : '#ff3366';
+              return (
+                <ResponsiveContainer width="100%" height={110}>
+                  <AreaChart data={curveData} margin={{top:4,right:4,bottom:0,left:0}}>
+                    <defs>
+                      <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="5%" stopColor={lineCol} stopOpacity={0.25}/>
+                        <stop offset="95%" stopColor={lineCol} stopOpacity={0}/>
+                      </linearGradient>
+                    </defs>
+                    <XAxis dataKey="ts" tick={{fontSize:7, fill:'#252550'}} interval={Math.max(0,Math.floor(curveData.length/8)-1)} tickLine={false} axisLine={false}/>
+                    <YAxis domain={[minPnl-1, maxPnl+1]} tick={{fontSize:7, fill:'#252550'}} tickFormatter={v=>`$${v.toFixed(0)}`} tickLine={false} axisLine={false} width={32}/>
+                    <Tooltip contentStyle={{background:'#0a0a1a',border:`1px solid ${lineCol}44`,borderRadius:6,fontSize:9}} formatter={(v,n,p)=>[`$${Number(v).toFixed(2)}`,p.payload?.win?'✅ WIN':'❌ LOSS']} labelFormatter={l=>`Bet: ${l}`}/>
+                    <ReferenceLine y={0} stroke="#252550" strokeDasharray="3 3"/>
+                    <Area type="monotone" dataKey="pnl" stroke={lineCol} strokeWidth={2} fill="url(#pnlGrad)" dot={(props)=>{ const{cx,cy,payload}=props; return payload.win ? <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#00e5aa" stroke="none"/> : <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#ff3366" stroke="none"/>; }}/>
+                  </AreaChart>
+                </ResponsiveContainer>
+              );
+            })()}
+          </div>
+
+          {/* ── ROW 3: Weights | Learning Log | Bet History ── */}
+          <div style={{ flex:1, display:'grid', gridTemplateColumns:'240px 1fr 1fr', gap:7, minHeight:0, overflow:'hidden' }}>
+
+            {/* Weights */}
+            <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
+              <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:12, marginBottom:8, flexShrink:0 }}>⚖️ Live Weights</div>
+              <div className="scroll" style={{ flex:1 }}>
+                {Object.entries(weights).sort(([,a],[,b])=>b-a).map(([k,v])=>(
+                  <div key={k} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6 }}>
+                    <span style={{ fontSize:8, color:'#3a3a6a', fontWeight:700, minWidth:90 }}>{k}</span>
+                    <div className="bar" style={{ flex:1, height:5 }}>
+                      <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:v>1.5?'#00e5aa':v<0.7?'#ff3366':'#c44dff', height:'100%', boxShadow:v>1.8?'0 0 5px #00e5aa':v<0.4?'0 0 5px #ff3366':'none', transition:'width .4s ease' }}/>
+                    </div>
+                    <span style={{ fontSize:9, fontWeight:800, color:v>1.5?'#00e5aa':v<0.7?'#ff3366':'#c44dff', minWidth:28 }}>{v.toFixed(2)}</span>
                   </div>
                 ))}
               </div>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:12, marginBottom:7 }}>Live Weights</div>
-              {Object.entries(weights).map(([k,v])=>(
-                <div key={k} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:5 }}>
-                  <span style={{ fontSize:9, color:'#3a3a6a', fontWeight:700, minWidth:100 }}>{k}</span>
-                  <div className="bar" style={{ flex:1, height:6 }}>
-                    <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:v>1.5?'#00e5aa':v<0.5?'#ff3366':'#c44dff', height:'100%', boxShadow:v>1.8?'0 0 6px #00e5aa':v<0.3?'0 0 6px #ff3366':'none' }}/>
-                  </div>
-                  <span style={{ fontSize:9, fontWeight:800, color:v>1.5?'#00e5aa':v<0.5?'#ff3366':'#c44dff', minWidth:32 }}>{v.toFixed(2)}</span>
-                </div>
-              ))}
-              <div style={{ display:'flex', gap:6, marginTop:8 }}>
-                <button className="btn" onClick={()=>setWeights(DEFAULT_WEIGHTS)} style={{ flex:1, background:'#08081e', color:'#252560', border:'1px solid #12122e', fontSize:10 }}>Reset Weights</button>
-                <button className="btn" onClick={()=>{ if(!window.confirm('Wipe ALL saved data? Balance, bets, weights, history.')) return; ['bd_weights','bd_balance','bd_betHistory','bd_paperBets','bd_aiLog','bd_pendingBet'].forEach(k=>localStorage.removeItem(k)); setWeights(DEFAULT_WEIGHTS); setBalance(100); setBetHistory([]); setPaperBets([]); setAiLog([]); setPendingBet(null); }} style={{ flex:1, background:'rgba(255,51,102,.08)', color:'#ff3366', border:'1px solid #ff336633', fontSize:10 }}>🗑 Wipe All Data</button>
-              </div>
             </div>
-            {betHistory.length>1 && <div className="card" style={{ padding:11, flex:1 }}>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:12, marginBottom:7 }}>📊 P&L Curve</div>
-              <ResponsiveContainer width="100%" height={100}>
-                <LineChart data={betHistory.map((b,i)=>({i:i+1,pnl:betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0)}))}>
-                  <XAxis dataKey="i" hide/><YAxis hide/>
-                  <Tooltip contentStyle={{ background:'#0a0a1a', border:'1px solid #ffd700', borderRadius:6, fontSize:9, fontFamily:'Nunito' }} formatter={v=>[`$${v.toFixed(2)}`,'P&L']}/>
-                  <Line type="monotone" dataKey="pnl" stroke="#ffd700" strokeWidth={2} dot={false}/>
-                </LineChart>
-              </ResponsiveContainer>
-            </div>}
-          </div>
-          <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
-            <div className="card" style={{ padding:12, flex:1, overflow:'hidden', display:'flex', flexDirection:'column' }}>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#00e5aa', fontSize:13, marginBottom:8 }}>📝 Learning Log</div>
+
+            {/* Learning Log */}
+            <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
+              <div style={{ fontFamily:"'Fredoka One'", color:'#00e5aa', fontSize:12, marginBottom:8, flexShrink:0 }}>📝 Learning Log</div>
               {aiLog.length===0 ? (
-                <div style={{ textAlign:'center', color:'#252550', padding:24, fontSize:10 }}><div style={{ fontSize:26, marginBottom:7 }}>🐾</div>Resolve paper bets to see AI learning</div>
+                <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', flexDirection:'column', gap:8, color:'#252550', fontSize:10 }}><div style={{fontSize:24}}>🐾</div>Resolve bets to see AI learning</div>
               ) : (
                 <div className="scroll" style={{ flex:1 }}>
                   {aiLog.map((e,i)=>(
-                    <div key={i} style={{ padding:'7px 0', borderBottom:'1px solid #090920', fontSize:10 }}>
+                    <div key={i} style={{ padding:'6px 0', borderBottom:'1px solid #090920', fontSize:9 }}>
                       <div style={{ display:'flex', justifyContent:'space-between', marginBottom:1 }}>
                         <span style={{ color:e.won?'#00e5aa':'#ff3366', fontWeight:800 }}>{e.note}</span>
                         <span style={{ color:'#252550', fontSize:8 }}>{e.time}</span>
                       </div>
-                      <div style={{ color:'#3a3a6a' }}>{e.direction} (conf:{e.conf}%)</div>
+                      <div style={{ color:'#3a3a6a' }}>{e.direction} · conf:{e.conf}%</div>
                     </div>
                   ))}
                 </div>
               )}
             </div>
-            <div className="card" style={{ padding:12, flex:1, overflow:'hidden', display:'flex', flexDirection:'column' }}>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:12, marginBottom:8 }}>💰 Bet History</div>
-              {paperBets.length===0 ? <div style={{ textAlign:'center', color:'#252550', padding:20, fontSize:10 }}>No bets placed</div> : (
+            {/* Bet History */}
+            <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
+              <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:12, marginBottom:8, flexShrink:0 }}>💰 Bet History <span style={{fontSize:8,color:'#252550'}}>({paperBets.length})</span></div>
+              {paperBets.length===0 ? (
+                <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', color:'#252550', fontSize:10 }}>No bets placed</div>
+              ) : (
                 <div className="scroll" style={{ flex:1 }}>
-                  {paperBets.map((b,i)=>(
-                    <div key={i} style={{ padding:'6px 0', borderBottom:'1px solid #090920' }}>
-                      <div style={{ display:'flex', justifyContent:'space-between', fontSize:11 }}>
-                        <span style={{ color:b.direction==='UP'?'#00e5aa':'#ff3366', fontWeight:800 }}>{b.direction==='UP'?'▲':'▼'} {b.direction} @{b.odds}¢</span>
+                  {[...paperBets].reverse().map((b,i)=>(
+                    <div key={b.id||i} style={{ padding:'6px 0', borderBottom:'1px solid #090920' }}>
+                      <div style={{ display:'flex', justifyContent:'space-between', fontSize:10 }}>
+                        <span style={{ color:b.direction==='UP'?'#00e5aa':'#ff3366', fontWeight:800 }}>{b.direction==='UP'?'▲':'▼'} {b.direction} @{b.odds}¢ {b.auto?<span style={{fontSize:7,color:'#c44dff'}}>🤖</span>:''}</span>
                         <span style={{ color:b.outcome===null?'#ffd700':b.outcome===b.direction?'#00e5aa':'#ff3366', fontWeight:800 }}>
-                          {b.outcome===null?'⏳':b.outcome===b.direction?`+$${(b.payout-b.amount).toFixed(2)}`:`-$${b.amount}`}
+                          {b.outcome===null?'⏳ pending':b.outcome===b.direction?`+$${(b.payout-b.amount).toFixed(2)}`:`-$${b.amount.toFixed(2)}`}
                         </span>
                       </div>
-                      <div style={{ fontSize:8, color:'#252550' }}>Conf:{b.conf}% • {b.score}/5 • ${b.amount} • {b.time}</div>
+                      <div style={{ fontSize:7, color:'#252550', marginTop:1 }}>conf:{b.conf}% · {b.score}/5 · ${b.amount} · {b.time}</div>
                       {b.outcome===null && <div style={{ display:'flex', gap:4, marginTop:4 }}>
-                        <button className="btn" onClick={()=>resolveBet(b.id,true)} style={{ flex:1, background:'rgba(0,229,170,.1)', color:'#00e5aa', border:'1px solid #00e5aa33', fontSize:9, padding:'3px' }}>✅ WIN</button>
-                        <button className="btn" onClick={()=>resolveBet(b.id,false)} style={{ flex:1, background:'rgba(255,51,102,.1)', color:'#ff3366', border:'1px solid #ff336633', fontSize:9, padding:'3px' }}>❌ LOSE</button>
+                        <button className="btn" onClick={()=>resolveBet(b.id,true)} style={{ flex:1, background:'rgba(0,229,170,.08)', color:'#00e5aa', border:'1px solid #00e5aa22', fontSize:8, padding:'3px' }}>✅ WIN</button>
+                        <button className="btn" onClick={()=>resolveBet(b.id,false)} style={{ flex:1, background:'rgba(255,51,102,.08)', color:'#ff3366', border:'1px solid #ff336622', fontSize:8, padding:'3px' }}>❌ LOSE</button>
                       </div>}
                     </div>
                   ))}
                 </div>
               )}
             </div>
-          </div>
+          </div>{/* end ROW 3 grid */}
         </div>
       )}
 

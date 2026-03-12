@@ -90,6 +90,7 @@ export function recommendedSize({
   marketPriceCents,   // Polymarket market price 0–100
   balance,            // current paper/real balance USDC
   conviction,         // Bayesian conviction 0–0.5 (abs(prob - 0.5))
+  historicalBets = 0, // total resolved bets in history (for prior blending)
   options = {},
 }) {
   const {
@@ -100,25 +101,38 @@ export function recommendedSize({
     minBet          = 1,      // minimum meaningful bet
   } = options;
 
+  // ── Win-rate prior blending (Fix 2) ───────────────────────────────────────
+  // Prevent Kelly inflation from short win streaks. Blend modelProb toward a
+  // conservative 55% prior. Blend fades out as historical sample grows past 30.
+  //   < 10 bets: 80% prior, 20% model  (not enough data)
+  //   10–30 bets: linearly transition
+  //   30+ bets: 100% model (trust it fully)
+  const PRIOR = 0.55;
+  const blendWeight = Math.min(1, Math.max(0, (historicalBets - 10) / 20)); // 0→1 over 10–30 bets
+  const blendedProb = PRIOR * (1 - blendWeight) + modelProb * blendWeight;
+
   const marketPrice = marketPriceCents / 100;
-  const { ev }      = calcEV(modelProb, marketPrice);
-  const { fracKelly } = kellyFraction(modelProb, marketPrice, kellyFrac);
+  const { ev }      = calcEV(blendedProb, marketPrice);
+  const { fracKelly } = kellyFraction(blendedProb, marketPrice, kellyFrac);
 
   // EV gate
   if (ev < minEV) {
     return {
       size: 0,
-      reason: `EV too low: ${(ev * 100).toFixed(1)}¢ < ${(minEV * 100).toFixed(0)}¢ minimum`,
+      reason: `EV too low: ${(ev * 100).toFixed(1)}¢ < ${(minEV * 100).toFixed(0)}¢ minimum${historicalBets < 30 ? ` (prior-blended, ${historicalBets} bets)` : ''}`,
       ev, fracKelly,
     };
   }
 
-  // Kelly-based size
+  // Kelly-based size (uses blended prob → conservative when sample is small)
   let size = balance * fracKelly;
 
   // Conviction multiplier: scale down when we're less certain
   // conviction 0.08 = 58% prob → 1.0x, conviction 0.15 = 65% → 1.3x
-  const convictionMul = 1.0 + Math.max(0, (conviction - 0.08) * 5);
+  // Dampen conviction multiplier until 30+ bets to avoid streak inflation
+  const convictionDamp = Math.min(1, historicalBets / 20); // 0→1 over first 20 bets
+  const rawMul = 1.0 + Math.max(0, (conviction - 0.08) * 5);
+  const convictionMul = 1.0 + (rawMul - 1.0) * convictionDamp;
   size *= Math.min(1.5, convictionMul);
 
   // Apply limits
@@ -136,7 +150,9 @@ export function recommendedSize({
     fracKelly: +fracKelly.toFixed(4),
     kellySize: +(balance * fracKelly).toFixed(2),
     convictionMul: +convictionMul.toFixed(3),
-    reason: `EV: +${(ev*100).toFixed(1)}¢ | Kelly: ${(fracKelly*100).toFixed(1)}% | Conviction: ${(conviction*200).toFixed(0)}%`,
+    blendedProb: +blendedProb.toFixed(3),
+    blendWeight: +blendWeight.toFixed(2),
+    reason: `EV: +${(ev*100).toFixed(1)}¢ | Kelly: ${(fracKelly*100).toFixed(1)}% | Conviction: ${(conviction*200).toFixed(0)}%${historicalBets < 30 ? ` | prior-blended (${historicalBets} bets)` : ''}`,
   };
 }
 
@@ -188,6 +204,7 @@ export function fullSizingDecision({
   upOdds,              // market UP cents
   dnOdds,              // market DOWN cents
   balance,             // current balance
+  historicalBets = 0,  // total resolved bets for prior blending
   options = {},
 }) {
   const { probUp, probDown, direction, conviction } = bayesResult;
@@ -200,7 +217,7 @@ export function fullSizingDecision({
 
   const evResult   = calcEV(modelProb, marketPrice);
   const kelly      = kellyFraction(modelProb, marketPrice, options.kellyFrac || 0.25);
-  const sizing     = recommendedSize({ modelProb, marketPriceCents: marketCents, balance, conviction, options });
+  const sizing     = recommendedSize({ modelProb, marketPriceCents: marketCents, balance, conviction, historicalBets, options });
   const expectancy = dailyExpectancy(modelProb, marketCents, sizing.size || 5);
   const ror        = riskOfRuin(modelProb, marketPrice, kelly.fracKelly, balance);
 

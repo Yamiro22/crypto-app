@@ -199,7 +199,9 @@ export function bayesianUpdate(priorProbUp, evidenceList) {
   }
 
   // Convert log-odds back to probability: P = σ(λ) = 1 / (1 + e^-λ)
-  const probUp = 1 / (1 + Math.exp(-logOdds));
+  // Fix 4: Cap at 95%/5% to preserve resolution — avoids 0%/100% saturation
+  const rawProbUp = 1 / (1 + Math.exp(-logOdds));
+  const probUp = Math.max(0.05, Math.min(0.95, rawProbUp));
 
   return {
     probUp: +probUp.toFixed(6),
