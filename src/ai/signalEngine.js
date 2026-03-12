@@ -88,10 +88,15 @@ export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresh
   // Odds ceiling: if favored side is >62¢, market is too confident — we can't beat it.
   // At 72¢ we need 72% accuracy; bot's observed rate is 44% → guaranteed negative EV.
   // Only bet in the 53–62¢ range where the edge requirement is achievable.
+  // intendedDir is attached so App.jsx can still run Quant override after long skip streaks.
   const favoredOdds = Math.max(upV, dnV);
   if (favoredOdds > 62) {
     const dir2 = upV > dnV ? 'UP' : 'DOWN';
-    return nobet(`🚫 Odds too high — ${dir2} at ${favoredOdds}¢ needs ${favoredOdds}% accuracy (sweet spot: 53–62¢).`, '#ff3366', []);
+    const nb = nobet(`🚫 Odds too high — ${dir2} at ${favoredOdds}¢ needs ${favoredOdds}% accuracy (sweet spot: 53–62¢).`, '#ff3366', []);
+    nb.intendedDir  = dir2;
+    nb.intendedOdds = favoredOdds;
+    nb.skipReason   = 'odds_ceiling';
+    return nb;
   }
 
   // Buffer skip — behaviour depends on threshold source:

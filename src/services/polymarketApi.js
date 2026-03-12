@@ -183,6 +183,27 @@ export async function fetchOddsHistory(tokenId) {
 // MAIN EXPORT — full market fetch
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TOKEN ID CACHE — persist across sessions so hedge bot doesn't need a fresh
+// Gamma fetch every time. Token IDs are stable for each market (days/weeks).
+// ─────────────────────────────────────────────────────────────────────────────
+const TOKEN_CACHE_KEY = 'bd_tokenIds';
+const TOKEN_CACHE_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
+function loadCachedTokenIds() {
+  try {
+    const raw = localStorage.getItem(TOKEN_CACHE_KEY);
+    if (!raw) return null;
+    const { upId, downId, ts } = JSON.parse(raw);
+    if (Date.now() - ts > TOKEN_CACHE_TTL) { localStorage.removeItem(TOKEN_CACHE_KEY); return null; }
+    return { upId, downId };
+  } catch { return null; }
+}
+
+function saveCachedTokenIds(ids) {
+  try { localStorage.setItem(TOKEN_CACHE_KEY, JSON.stringify({ ...ids, ts: Date.now() })); } catch {}
+}
+
 export async function fetchActiveBTCMarket() {
   // Phase 1: find market
   let market = null;
@@ -195,7 +216,16 @@ export async function fetchActiveBTCMarket() {
 
   // Extract base info from Gamma
   const base    = extractGammaOdds(market);
-  const tokenIds = extractTokenIds(market);
+  let tokenIds   = extractTokenIds(market);
+
+  // Phase 1b: if Gamma didn't return token IDs, try localStorage cache
+  if (!tokenIds) {
+    const cached = loadCachedTokenIds();
+    if (cached) {
+      console.log('[Poly] Using cached token IDs');
+      tokenIds = cached;
+    }
+  }
 
   // Phase 2: enrich with CLOB live price
   if (tokenIds) {
@@ -205,13 +235,17 @@ export async function fetchActiveBTCMarket() {
       base.downOdds = live.downOdds;
       base.tokenIds = tokenIds;
       base.source   = 'clob-live';
+      saveCachedTokenIds(tokenIds); // persist on success
       console.log('[Poly] CLOB live odds:', live.upOdds, '↑ /', live.downOdds, '↓');
     } catch (e) {
       console.warn('[Poly] CLOB price fallback to Gamma:', e.message);
-      base.source = 'gamma-fallback';
+      // Still attach tokenIds even if price fetch failed — hedge bot needs them
+      base.tokenIds = tokenIds;
+      base.source   = 'gamma-fallback';
     }
   } else {
     base.source = 'gamma-no-tokens';
+    console.warn('[Poly] No token IDs found in Gamma response. Fields:', Object.keys(market).join(', '));
   }
 
   return base;

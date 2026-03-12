@@ -114,21 +114,8 @@ export default function App() {
   const [sessionStats, setSessionStats] = useState({ wins:0, losses:0, startBal:100, skipReasons:{rule:0,bayes:0,lmsr:0,balance:0,circuit:0} });
   const autoRef = useRef({ autoBot: false, pred: null, price: null, threshold: null, pendingBet: null, balance: parseFloat(localStorage.getItem('bd_balance')||'100'), fetchedThisRound: false, bettedThisRound: false, betAmt: 5, botCfg: {minScore:3,minConf:55,useKelly:true,maxConsecLosses:3,stopLoss:20,profitTarget:30}, upOdds: 0, dnOdds: 0, tfData: {}, whaleSentiment: {score:0,label:'NEUTRAL'}, oddsHistory: [], spreadData: null, consecLosses: 0, sessionStartBal: parseFloat(localStorage.getItem('bd_balance')||'100'), paused: false });
 
-  // ── Hedge / Arb Mode ──
-  const [hedgeMode,   setHedgeMode]   = useState(false);
-  const [hedgeCfg,    setHedgeCfg]    = useState({ shares: 10, sum: 0.94, move: 0.15, windowMin: 3 });
-  const [hedgeState,  setHedgeState]  = useState('IDLE');
-  const [hedgeLeg1,   setHedgeLeg1]   = useState(null);
-  const [hedgeLeg2,   setHedgeLeg2]   = useState(null);
-  const [hedgeLogs,   setHedgeLogs]   = useState([]);
-  const [hedgePrices, setHedgePrices] = useState({ up: null, down: null });
-  const [hedgeStats,  setHedgeStats]  = useState({ profit: 0, cycles: 0 });
-  const hedgeRef    = useRef({ mode: false, state: 'IDLE', leg1: null, history: [], roundStart: null, prevSecs: 999 });
-  const polyRoundRef = useRef(null);
-
   // ── UI ──
   const [activeTab,    setActiveTab]    = useState('dashboard');
-  const [autoBotMode,  setAutoBotMode]  = useState('signal'); // 'signal' | 'hedge'
 
   const winRate  = betHistory.length ? Math.round(betHistory.filter(b=>b.correct).length/betHistory.length*100) : 0;
   const totalPnL = betHistory.reduce((a,b)=>a+b.pnl, 0);
@@ -325,14 +312,7 @@ export default function App() {
     setBotLog(p => [entry, ...p].slice(0, 50));
   };
 
-  const hedgeLog_add = (msg, type='info') => {
-    const entry = { time: new Date().toLocaleTimeString(), msg, type };
-    setHedgeLogs(p => [entry, ...p].slice(0, 60));
-  };
-
-  // Keep polyRoundRef in sync for hedge engine (avoids stale closure)
-  useEffect(() => { polyRoundRef.current = polyRound; }, [polyRound]);
-  // Fix 3: Auto-sync threshold from fresh Polymarket data into autoRef
+  // Auto-sync threshold from fresh Polymarket data into autoRef
   useEffect(() => {
     if (polyRound?.threshold) {
       autoRef.current.threshold = polyRound.threshold.toString();
@@ -482,6 +462,17 @@ export default function App() {
           ref.paused = false; // unpause after one skip
           setSkippedCount(n => n + 1);
           setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, circuit: s.skipReasons.circuit + 1 } }));
+          setBotStatus('watching');
+          return;
+        }
+
+        // ── [0] HARD ODDS CEILING — 62¢ max, no exceptions ────────────────
+        // Above 62¢ you need >62% accuracy to profit. Engine runs at ~46%.
+        if (curUp > 62 || curDn > 62) {
+          const high = curUp > curDn ? `UP ${curUp}¢` : `DN ${curDn}¢`;
+          botLog_add(`🚫 ODDS CEILING — ${high} > 62¢ cap → negative EV guaranteed. Skipping.`, 'skip');
+          setSkippedCount(n => n + 1);
+          setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, rule: s.skipReasons.rule + 1 } }));
           setBotStatus('watching');
           return;
         }
@@ -728,147 +719,19 @@ export default function App() {
     return () => { clearInterval(tick); setBotStatus('idle'); autoRef.current.lastStopTime = Date.now(); };
   }, [autoBot, botPlaceBet, botResolveBet, fetchData]);
 
-  // ─── HEDGE / ARB ENGINE ──────────────────────────────────────────────────
-  // Two-leg volatility arb on 5-min BTC UP/DOWN markets:
-  //  Leg 1: buy the side that dumps ≥ move% in 3s (during windowMin)
-  //  Leg 2: buy opposite when leg1Price + oppAsk ≤ sum → guaranteed profit
+  // ─── AUTO-FILL ODDS WHEN DATA LOADS ────────────────────────────────────
+  // Automatically SmartFill odds whenever fresh chart data arrives.
+  // Only runs when odds are empty OR when they were set by SmartFill (not manual/real Polymarket).
+  // This way: fresh Fetch → instant signal without any manual button click.
   useEffect(() => {
-    if (!hedgeMode) {
-      setHedgeState('IDLE');
-      hedgeRef.current.state = 'IDLE';
-      return;
+    if (Object.keys(tfData).length > 0 && price) {
+      // Auto-fill if: odds are empty, OR previous fill was also from SmartFill (keep fresh)
+      if (!upOdds || !dnOdds || thresholdSource === 'smartfill') {
+        smartFill();
+      }
     }
-
-    hedgeRef.current = { mode: true, state: 'WAITING_ROUND', leg1: null, history: [], roundStart: null, prevSecs: 999 };
-    setHedgeState('WAITING_ROUND');
-    setHedgeLeg1(null); setHedgeLeg2(null);
-    hedgeLog_add('🎯 Hedge Mode STARTED — waiting for round boundary', 'start');
-    hedgeLog_add(`⚙️ Config: shares=${hedgeCfg.shares} sum=${hedgeCfg.sum} dump=${hedgeCfg.move*100}% window=${hedgeCfg.windowMin}min`, 'start');
-
-    const tick = setInterval(async () => {
-      const cfg      = hedgeCfg;
-      const secs     = secsToNextRound();
-      const tokenIds = polyRoundRef.current?.tokenIds;
-      const now      = Date.now();
-      const { state, leg1, history, roundStart, prevSecs } = hedgeRef.current;
-
-      // ── Detect new round start: timer wraps from low → ~300 ──
-      if (secs >= 297 && prevSecs < 15) {
-        const newState = 'WATCHING';
-        hedgeRef.current = { ...hedgeRef.current, state: newState, leg1: null, history: [], roundStart: now, prevSecs: secs };
-        setHedgeState(newState);
-        setHedgeLeg1(null);
-        setHedgeLeg2(null);
-        hedgeLog_add(`🔄 New round! Watching first ${cfg.windowMin}min for a ≥${cfg.move*100}% dump`, 'round');
-        return;
-      }
-      hedgeRef.current.prevSecs = secs;
-
-      // ── Need token IDs from Polymarket ──
-      if (!tokenIds) {
-        if (Math.random() < 0.05) hedgeLog_add('⚠️ No token IDs — press 📡 Auto Fetch on Dashboard', 'warn');
-        return;
-      }
-
-      // ── Fetch live CLOB prices (decimal 0–1) ──
-      let upRaw = 0, downRaw = 0;
-      try {
-        const [upRes, dnRes] = await Promise.all([
-          fetch(`/polymarket-clob/price?token_id=${tokenIds.upId}&side=BUY`).then(r => r.json()),
-          fetch(`/polymarket-clob/price?token_id=${tokenIds.downId}&side=BUY`).then(r => r.json()),
-        ]);
-        upRaw   = parseFloat(upRes.price   || 0);
-        downRaw = parseFloat(dnRes.price   || 0);
-      } catch (_) { return; }
-      if (!upRaw || !downRaw) return;
-
-      setHedgePrices({ up: upRaw, down: downRaw });
-
-      // ── Maintain 8s price history ring buffer ──
-      hedgeRef.current.history = [
-        ...hedgeRef.current.history.filter(p => now - p.ts < 8000),
-        { ts: now, up: upRaw, down: downRaw },
-      ];
-
-      const curState = hedgeRef.current.state;
-      const curLeg1  = hedgeRef.current.leg1;
-      const curRoundStart = hedgeRef.current.roundStart;
-      const inWindow = curRoundStart && (now - curRoundStart) < cfg.windowMin * 60 * 1000;
-
-      // ── WATCHING: scan for ≥move% dump in last 3s ──
-      if (curState === 'WATCHING') {
-        if (inWindow) {
-          const hist     = hedgeRef.current.history;
-          const oldest3s = hist.find(p => now - p.ts >= 2800 && now - p.ts <= 5000);
-
-          if (oldest3s) {
-            for (const side of ['UP', 'DOWN']) {
-              const oldP = side === 'UP' ? oldest3s.up : oldest3s.down;
-              const newP = side === 'UP' ? upRaw        : downRaw;
-              const drop = oldP > 0 ? (oldP - newP) / oldP : 0;
-
-              if (drop >= cfg.move && newP >= 0.08 && newP <= 0.62) {
-                const l1 = { side, price: +newP.toFixed(5), time: new Date().toLocaleTimeString() };
-                hedgeRef.current.leg1  = l1;
-                hedgeRef.current.state = 'LEG1_FILLED';
-                setHedgeLeg1(l1);
-                setHedgeState('LEG1_FILLED');
-                hedgeLog_add(`⚡ DUMP! ${side} ↓${(drop*100).toFixed(1)}% in ~3s  ($${oldP.toFixed(3)}→$${newP.toFixed(3)})`, 'leg1');
-                hedgeLog_add(`✅ LEG 1: BUY ${side} @ $${newP.toFixed(4)} × ${cfg.shares} shares`, 'leg1');
-                hedgeLog_add(`👀 Watching for hedge: need opp ≤ $${(cfg.sum - newP).toFixed(4)}`, 'info');
-                break;
-              }
-            }
-          }
-        } else if (curRoundStart) {
-          // Window expired — no dump found
-          hedgeRef.current.state = 'WAITING_ROUND';
-          setHedgeState('WAITING_ROUND');
-          hedgeLog_add(`⏰ Window closed (${cfg.windowMin}min) — no qualifying dump. Next round...`, 'warn');
-        }
-      }
-
-      // ── LEG1_FILLED: watch for hedge condition ──
-      if (curState === 'LEG1_FILLED' && curLeg1) {
-        const oppPrice = curLeg1.side === 'UP' ? downRaw : upRaw;
-        const oppSide  = curLeg1.side === 'UP' ? 'DOWN' : 'UP';
-        const combined = +(curLeg1.price + oppPrice).toFixed(5);
-
-        // Log progress every ~5s
-        if (Math.random() < 0.2) {
-          hedgeLog_add(`⏳ Hedge watch: ${oppSide} ask=$${oppPrice.toFixed(4)} | sum=$${combined.toFixed(4)} (need ≤$${cfg.sum})`, 'info');
-        }
-
-        if (combined <= cfg.sum) {
-          const profitPct = +((1 - combined) * 100).toFixed(2);
-          const profitUSD = +((1 - combined) * cfg.shares).toFixed(4);
-          const l2 = { side: oppSide, price: +oppPrice.toFixed(5), combined, time: new Date().toLocaleTimeString() };
-
-          hedgeRef.current.state = 'COMPLETE';
-          setHedgeLeg2(l2);
-          setHedgeState('COMPLETE');
-          setHedgeStats(p => ({ profit: +(p.profit + profitUSD).toFixed(4), cycles: p.cycles + 1 }));
-
-          hedgeLog_add(`🏹 LEG 2: BUY ${oppSide} @ $${oppPrice.toFixed(4)} × ${cfg.shares} shares`, 'leg2');
-          hedgeLog_add(`💰 LOCKED ${profitPct}% profit = $${profitUSD} | total cost $${combined.toFixed(4)} ≤ $${cfg.sum} ✓`, 'profit');
-          hedgeLog_add(`🎯 Holding ${cfg.shares} UP + ${cfg.shares} DOWN → $1/share payout at round end`, 'profit');
-        }
-      }
-
-      // ── COMPLETE: auto-reset when round ends ──
-      if (curState === 'COMPLETE' && secs <= 8) {
-        hedgeRef.current.state = 'WAITING_ROUND';
-        hedgeRef.current.leg1  = null;
-        setHedgeState('WAITING_ROUND');
-        hedgeLog_add('✅ Round ended — payout collected. Resetting for next round...', 'round');
-      }
-
-    }, 1000);
-
-    return () => { clearInterval(tick); setHedgeState('IDLE'); };
-  }, [hedgeMode, hedgeCfg]);
-
-  // ─── PAPER BETTING ───────────────────────────────────────────────────────
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tfData]);
   const placeBet = () => {
     if (!pred || !['UP','DOWN'].includes(pred.result)) return;
     const amt = parseFloat(betAmt) || 5;
@@ -986,8 +849,8 @@ export default function App() {
                 <div style={{ fontSize:9, color:polyStatus.includes('✅')||polyStatus.includes('📊')?'#00e5aa':polyStatus.includes('⚠')?'#ff9d00':'#ffd700', marginBottom:7, fontWeight:700, padding:'4px 7px', background:'rgba(255,255,255,.03)', borderRadius:5 }}>{polyStatus}</div>
               ) : (
                 <div style={{ fontSize:9, color:'#303060', marginBottom:7, lineHeight:1.6, padding:'5px 7px', background:'#050510', borderRadius:6, border:'1px solid #0f0f28' }}>
-                  <span style={{color:'#ff9d00',fontWeight:800}}>① Fetch Data</span> → <span style={{color:'#ff9d00',fontWeight:800}}>📊 Smart Fill</span> → odds auto-populate<br/>
-                  <span style={{color:'#303060'}}>Or enter manually below. ⚡ Auto is often CORS-blocked.</span>
+                  <span style={{color:'#00e5aa',fontWeight:800}}>⚡ Auto-filling</span> odds from chart signals on each fetch<br/>
+                  <span style={{color:'#303060'}}>Or enter manually below. ⚡ Auto tries real Polymarket too.</span>
                 </div>
               )}
 
@@ -1452,26 +1315,7 @@ export default function App() {
       ══════════════════════════════════════════════════════ */}
       {activeTab==='autobot' && (
         <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
-
-          {/* ── Mode Selector ── */}
-          <div style={{ display:'flex', gap:0, padding:'6px 10px 0', flexShrink:0 }}>
-            {[['signal','🤖 Signal Bot'],['hedge','🎯 Hedge Arb']].map(([id,label])=>(
-              <button key={id} onClick={()=>setAutoBotMode(id)}
-                style={{ padding:'7px 18px', border:'none', cursor:'pointer', fontFamily:"'Fredoka One'", fontSize:12, letterSpacing:.4,
-                  background: autoBotMode===id ? (id==='signal'?'#00e5aa':'#ff6d00') : '#0a0a1a',
-                  color: autoBotMode===id ? '#050510' : '#2a2a5a',
-                  borderRadius: id==='signal'?'8px 0 0 0':'0 8px 0 0',
-                  borderBottom: autoBotMode===id?'none':'1px solid #131328',
-                }}>
-                {label}
-              </button>
-            ))}
-            <div style={{ flex:1, borderBottom:'1px solid #131328' }}/>
-          </div>
-
-          {/* ════════════════════════════════ SIGNAL BOT MODE ════════════════════════════════ */}
-          {autoBotMode==='signal' && (
-            <div style={{ flex:1, padding:10, display:'grid', gridTemplateColumns:'280px 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
+          <div style={{ flex:1, padding:10, display:'grid', gridTemplateColumns:'280px 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
 
               {/* ── LEFT: Controls ── */}
               <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
@@ -1733,196 +1577,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ════════════════════════════════ HEDGE ARB MODE ════════════════════════════════ */}
-          {autoBotMode==='hedge' && (
-            <div style={{ flex:1, padding:10, display:'grid', gridTemplateColumns:'290px 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
-
-              {/* ── LEFT: Hedge Controls ── */}
-              <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
-
-                {/* ON/OFF card */}
-                <div className="card" style={{ padding:14, border:`2px solid ${hedgeMode ? '#ff6d00' : '#131328'}`, boxShadow: hedgeMode ? '0 0 20px rgba(255,109,0,.15)' : 'none' }}>
-                  <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:15, marginBottom:2 }}>🎯 Hedge Arb Bot</div>
-                  <div style={{ fontSize:9, color:'#3a3a6a', marginBottom:10, lineHeight:1.6 }}>
-                    Buys the dumped side then hedges opposite. Locks in profit when combined cost &lt; sum target. Needs Polymarket auto-fetch active.
-                  </div>
-
-                  <button onClick={() => { setHedgeMode(m => !m); if(hedgeMode){ setHedgeLogs([]); setHedgeStats({ profit:0, cycles:0 }); }}}
-                    style={{ width:'100%', padding:'13px', borderRadius:12, border:'none', cursor:'pointer', fontFamily:"'Fredoka One'", fontSize:16, letterSpacing:1,
-                      background: hedgeMode ? 'linear-gradient(135deg,#ff6d00,#cc4400)' : 'linear-gradient(135deg,#1a1a3a,#0f0f28)',
-                      color: hedgeMode ? '#fff' : '#252560',
-                      boxShadow: hedgeMode ? '0 0 20px rgba(255,109,0,.3)' : 'none',
-                      transition:'all .3s', marginBottom:10 }}>
-                    {hedgeMode ? '⏹ STOP HEDGE' : '▶ START HEDGE'}
-                  </button>
-
-                  {/* State badge */}
-                  {(() => {
-                    const S = { IDLE:{c:'#252550',bg:'#0a0a1a',lbl:'● IDLE'}, WAITING_ROUND:{c:'#3a3a6a',bg:'#0a0a1a',lbl:'⏳ WAITING ROUND'}, WATCHING:{c:'#00c8ff',bg:'rgba(0,200,255,.08)',lbl:'◉ WATCHING'}, LEG1_FILLED:{c:'#ffd700',bg:'rgba(255,215,0,.08)',lbl:'⚡ LEG 1 FILLED'}, COMPLETE:{c:'#00e5aa',bg:'rgba(0,229,170,.08)',lbl:'✓ COMPLETE'} };
-                    const s = S[hedgeState] || S.IDLE;
-                    return (
-                      <div style={{ padding:'8px 10px', borderRadius:8, background:s.bg, border:`1px solid ${s.c}33`, display:'flex', alignItems:'center', gap:8 }}>
-                        <div style={{ width:8, height:8, borderRadius:'50%', background:s.c, flexShrink:0, animation: hedgeState==='WATCHING'||hedgeState==='LEG1_FILLED'?'flash 1s infinite':'none' }}/>
-                        <div style={{ fontFamily:"'Fredoka One'", fontSize:12, color:s.c }}>{s.lbl}</div>
-                      </div>
-                    );
-                  })()}
-                </div>
-
-                {/* Config sliders */}
-                <div className="card" style={{ padding:12 }}>
-                  <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:13, marginBottom:10 }}>⚙️ Parameters</div>
-                  {[
-                    { key:'shares',    label:'SHARES',       min:1,    max:500,  step:1,    fmt: v => v },
-                    { key:'sum',       label:'SUM TARGET',   min:0.80, max:0.99, step:0.01, fmt: v => `$${v}` },
-                    { key:'move',      label:'DUMP %',       min:0.05, max:0.40, step:0.01, fmt: v => `${(v*100).toFixed(0)}%` },
-                    { key:'windowMin', label:'WINDOW (min)', min:1,    max:4,    step:0.5,  fmt: v => `${v}m` },
-                  ].map(({ key, label, min, max, step, fmt }) => (
-                    <div key={key} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:9 }}>
-                      <span style={{ fontSize:9, color:'#252550', fontWeight:800, letterSpacing:1 }}>{label}</span>
-                      <div style={{ display:'flex', alignItems:'center', gap:6 }}>
-                        <input type="range" min={min} max={max} step={step} value={hedgeCfg[key]} disabled={hedgeMode}
-                          onChange={e => setHedgeCfg(c => ({ ...c, [key]: parseFloat(e.target.value) }))}
-                          style={{ width:80, accentColor:'#ff6d00' }}/>
-                        <span style={{ fontSize:11, color:'#e0e0ff', fontWeight:800, minWidth:38, textAlign:'right' }}>{fmt(hedgeCfg[key])}</span>
-                      </div>
-                    </div>
-                  ))}
-                  <div style={{ marginTop:6, padding:'7px 9px', background:'#050510', borderRadius:7, border:'1px solid #131328', fontSize:9, color:'#3a3a6a', lineHeight:1.7 }}>
-                    <span style={{ color:'#ff6d00', fontWeight:800 }}>CMD: </span>auto on {hedgeCfg.shares} {hedgeCfg.sum} {hedgeCfg.move} {hedgeCfg.windowMin}
-                  </div>
-                </div>
-
-                {/* Live prices + legs */}
-                <div className="card" style={{ padding:12 }}>
-                  <div style={{ fontFamily:"'Fredoka One'", color:'#00c8ff', fontSize:12, marginBottom:8 }}>📡 Live Prices (CLOB)</div>
-                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:7, marginBottom:10 }}>
-                    {[['UP',hedgePrices.up,'#00e5aa',hedgeLeg1?.side==='UP'],[
-                      'DOWN',hedgePrices.down,'#ff3366',hedgeLeg1?.side==='DOWN']].map(([side,p,c,isLeg1])=>(
-                      <div key={side} style={{ background:'#050510', borderRadius:8, padding:'9px', textAlign:'center', border:`1px solid ${isLeg1?c+'66':'#0a0a1a'}`, boxShadow: isLeg1?`0 0 8px ${c}33`:'' }}>
-                        <div style={{ fontSize:8, color:'#252550', fontWeight:800, marginBottom:2 }}>{side}</div>
-                        <div style={{ fontFamily:"'Fredoka One'", fontSize:18, color:c }}>{p ? `$${p.toFixed(4)}` : '—'}</div>
-                        {isLeg1 && <div style={{ fontSize:8, color:'#ffd700', marginTop:2 }}>⚡ LEG 1</div>}
-                      </div>
-                    ))}
-                  </div>
-
-                  {/* Active legs */}
-                  {hedgeLeg1 && (
-                    <div style={{ fontSize:9, lineHeight:1.9 }}>
-                      <div style={{ display:'flex', justifyContent:'space-between' }}>
-                        <span style={{ color:'#252550' }}>LEG 1</span>
-                        <span style={{ color:'#ffd700', fontWeight:800 }}>BUY {hedgeLeg1.side} @ ${hedgeLeg1.price.toFixed(4)}</span>
-                      </div>
-                      {hedgeLeg2 ? (
-                        <>
-                          <div style={{ display:'flex', justifyContent:'space-between' }}>
-                            <span style={{ color:'#252550' }}>LEG 2</span>
-                            <span style={{ color:'#00e5aa', fontWeight:800 }}>BUY {hedgeLeg2.side} @ ${hedgeLeg2.price.toFixed(4)}</span>
-                          </div>
-                          <div style={{ display:'flex', justifyContent:'space-between', borderTop:'1px solid #131328', paddingTop:4 }}>
-                            <span style={{ color:'#252550' }}>TOTAL COST</span>
-                            <span style={{ color:'#00e5aa', fontWeight:800 }}>${hedgeLeg2.combined.toFixed(4)}</span>
-                          </div>
-                          <div style={{ display:'flex', justifyContent:'space-between' }}>
-                            <span style={{ color:'#252550' }}>PROFIT LOCKED</span>
-                            <span style={{ color:'#00e5aa', fontWeight:800 }}>
-                              {((1 - hedgeLeg2.combined) * 100).toFixed(1)}% = ${((1 - hedgeLeg2.combined) * hedgeCfg.shares).toFixed(3)}
-                            </span>
-                          </div>
-                        </>
-                      ) : (
-                        hedgePrices.up && hedgePrices.down && (
-                          <div style={{ display:'flex', justifyContent:'space-between' }}>
-                            <span style={{ color:'#252550' }}>CURR SUM</span>
-                            <span style={{ color: (hedgeLeg1.price + (hedgeLeg1.side==='UP'?hedgePrices.down:hedgePrices.up)) <= hedgeCfg.sum ? '#00e5aa' : '#ff6d00', fontWeight:800 }}>
-                              ${(hedgeLeg1.price + (hedgeLeg1.side==='UP'?hedgePrices.down:hedgePrices.up)).toFixed(4)} / ${hedgeCfg.sum}
-                            </span>
-                          </div>
-                        )
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                {/* Session stats */}
-                <div className="card" style={{ padding:12 }}>
-                  <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:12, marginBottom:8 }}>📊 Session Stats</div>
-                  <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6 }}>
-                    {[['CYCLES', hedgeStats.cycles, '#c44dff'],['LOCKED $', `$${hedgeStats.profit.toFixed(3)}`, '#00e5aa']].map(([l,v,c])=>(
-                      <div key={l} style={{ background:'#050510', borderRadius:7, padding:'9px', textAlign:'center' }}>
-                        <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>{l}</div>
-                        <div style={{ fontFamily:"'Fredoka One'", fontSize:18, color:c, marginTop:2 }}>{v}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-
-              {/* ── RIGHT: Hedge Log ── */}
-              <div className="card" style={{ padding:13, display:'flex', flexDirection:'column', overflow:'hidden' }}>
-                <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10, flexShrink:0 }}>
-                  <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:14 }}>📋 Hedge Activity Log</div>
-                  <button onClick={()=>setHedgeLogs([])} style={{ background:'#0c0c22', color:'#252560', border:'1px solid #131328', borderRadius:6, padding:'3px 10px', fontSize:9, cursor:'pointer', fontFamily:"'Fredoka One'" }}>Clear</button>
-                </div>
-
-                {hedgeLogs.length === 0 ? (
-                  <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', flexDirection:'column', gap:10 }}>
-                    <div style={{ fontSize:32 }}>🎯</div>
-                    <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:13 }}>Hedge Bot is idle</div>
-                    <div style={{ fontSize:10, color:'#252550', textAlign:'center', lineHeight:1.9, maxWidth:340 }}>
-                      1. Press 📡 Auto Fetch on Dashboard (get token IDs)<br/>
-                      2. Adjust parameters above<br/>
-                      3. Click ▶ START HEDGE<br/>
-                      4. Bot watches for dumps at each round start<br/>
-                      5. Leg 1 buys the dump → Leg 2 hedges opposite
-                    </div>
-                    <div style={{ padding:'8px 14px', background:'rgba(255,109,0,.07)', borderRadius:8, border:'1px solid rgba(255,109,0,.2)', fontSize:10, color:'#ff6d00', lineHeight:1.7, maxWidth:340 }}>
-                      <strong>How it works:</strong><br/>
-                      If UP or DOWN drops ≥{hedgeCfg.move*100}% in 3s → buy that side<br/>
-                      Then wait until leg1 + opp ask ≤ ${hedgeCfg.sum}<br/>
-                      Result: hold both sides → $1 payout → profit!
-                    </div>
-                  </div>
-                ) : (
-                  <div className="scroll" style={{ flex:1 }}>
-                    {hedgeLogs.map((entry, i) => {
-                      const col = entry.type==='profit'?'#00e5aa': entry.type==='leg2'?'#00e5aa': entry.type==='leg1'?'#ffd700': entry.type==='round'?'#00c8ff': entry.type==='warn'?'#ff3366': entry.type==='start'?'#ff6d00':'#3a3a6a';
-                      const bg  = entry.type==='profit'?'rgba(0,229,170,.06)': entry.type==='leg1'?'rgba(255,215,0,.05)': entry.type==='leg2'?'rgba(0,229,170,.05)':'transparent';
-                      return (
-                        <div key={i} style={{ padding:'7px 10px', borderRadius:7, marginBottom:3, background:bg, borderLeft:`3px solid ${col}` }}>
-                          <div style={{ display:'flex', justifyContent:'space-between' }}>
-                            <span style={{ fontSize:10, color:col, fontWeight:800 }}>{entry.msg}</span>
-                            <span style={{ fontSize:8, color:'#252550', flexShrink:0, marginLeft:8 }}>{entry.time}</span>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                {/* Strategy reminder */}
-                {hedgeMode && (
-                  <div style={{ flexShrink:0, marginTop:8, padding:'8px 10px', background:'#050510', borderRadius:8, border:'1px solid #131328' }}>
-                    <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:6, fontSize:9 }}>
-                      {[
-                        { n:'1', lbl:'WATCH', detail:`${hedgeCfg.windowMin}min window`, active: hedgeState==='WATCHING', c:'#00c8ff' },
-                        { n:'2', lbl:'LEG 1', detail:`Dump ≥${hedgeCfg.move*100}%`, active: hedgeState==='LEG1_FILLED', c:'#ffd700' },
-                        { n:'3', lbl:'LEG 2', detail:`Sum ≤$${hedgeCfg.sum}`, active: hedgeState==='LEG1_FILLED' && !!hedgeLeg1, c:'#ff6d00' },
-                        { n:'4', lbl:'PROFIT', detail:'$1 payout', active: hedgeState==='COMPLETE', c:'#00e5aa' },
-                      ].map(({ n, lbl, detail, active, c }) => (
-                        <div key={n} style={{ textAlign:'center', opacity: active ? 1 : 0.35 }}>
-                          <div style={{ width:18, height:18, borderRadius:'50%', background: active ? c+'22' : '#0a0a1a', border:`1.5px solid ${active ? c : '#131328'}`, color: active ? c : '#252550', fontSize:9, fontWeight:800, display:'flex', alignItems:'center', justifyContent:'center', margin:'0 auto 3px' }}>{n}</div>
-                          <div style={{ fontFamily:"'Fredoka One'", color: active ? c : '#252550', fontSize:10 }}>{lbl}</div>
-                          <div style={{ color:'#252550', fontSize:8 }}>{detail}</div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
         </div>
       )}
 
@@ -2014,19 +1668,41 @@ export default function App() {
                 const autoWins = autoBets.filter(b=>b.correct).length;
                 const autoWR   = autoBets.length ? Math.round(autoWins/autoBets.length*100) : 0;
                 const streak   = (() => { let s=0; for(let i=betHistory.length-1;i>=0;i--){ if(betHistory[i].correct){ if(s>=0)s++; else break; } else { if(s<=0)s--; else break; } } return s; })();
-                return [
-                  ['TOTAL', betHistory.length, '#c44dff'],
-                  ['WIN %', `${winRate}%`, winRate>=55?'#00e5aa':'#ff3366'],
-                  ['BOT W%', autoBets.length?`${autoWR}%`:'—', autoWR>=55?'#00e5aa':autoBets.length?'#ff3366':'#3a3a6a'],
-                  ['P&L', `${totalPnL>=0?'+':''}$${totalPnL.toFixed(2)}`, totalPnL>=0?'#00e5aa':'#ff3366'],
-                  ['BALANCE', `$${balance.toFixed(2)}`, '#ffd700'],
-                  ['STREAK', streak===0?'—':streak>0?`+${streak}W`:`${Math.abs(streak)}L`, streak>0?'#00e5aa':streak<0?'#ff3366':'#3a3a6a'],
-                ].map(([l,v,col])=>(
-                  <div key={l} style={{ background:'#050510', borderRadius:8, padding:'7px 12px', textAlign:'center', minWidth:56 }}>
-                    <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>{l}</div>
-                    <div style={{ fontFamily:"'Fredoka One'", fontSize:15, color:col, marginTop:1 }}>{v}</div>
-                  </div>
-                ));
+                // Last-10 warning
+                const last10 = betHistory.slice(-10);
+                const last10WR = last10.length >= 5 ? Math.round(last10.filter(b=>b.correct).length/last10.length*100) : null;
+                const warnLow = last10WR !== null && last10WR < 40;
+                // Win rate color: red<50, yellow 50-55, green 55+
+                const wrColor = winRate >= 55 ? '#00e5aa' : winRate >= 50 ? '#ffd700' : '#ff3366';
+                const autoWRColor = autoWR >= 55 ? '#00e5aa' : autoWR >= 50 ? '#ffd700' : autoBets.length ? '#ff3366' : '#3a3a6a';
+                // Balance vs starting 100
+                const balLoss = ((balance - 100) / 100 * 100).toFixed(1);
+                const balColor = balance >= 100 ? '#00e5aa' : balance >= 75 ? '#ffd700' : '#ff3366';
+                return (
+                  <>
+                    {warnLow && (
+                      <div style={{ width:'100%', padding:'4px 10px', background:'rgba(255,51,102,.1)', border:'1px solid #ff336633', borderRadius:7, fontSize:9, color:'#ff3366', fontWeight:800 }}>
+                        ⚠️ Last 10 bets: {last10WR}% WR — consider pausing Auto-Bot for recalibration
+                      </div>
+                    )}
+                    {[
+                      ['TOTAL', betHistory.length, '#c44dff'],
+                      ['WIN %', `${winRate}%`, wrColor],
+                      ['BOT W%', autoBets.length?`${autoWR}%`:'—', autoWRColor],
+                      ['P&L', `${totalPnL>=0?'+':''}$${totalPnL.toFixed(2)}`, totalPnL>=0?'#00e5aa':'#ff3366'],
+                      ['BALANCE', `$${balance.toFixed(2)}`, balColor],
+                      ['STREAK', streak===0?'—':streak>0?`+${streak}W`:`${Math.abs(streak)}L`, streak>0?'#00e5aa':streak<0?'#ff3366':'#3a3a6a'],
+                    ].map(([l,v,col])=>(
+                      <div key={l} style={{ background:'#050510', borderRadius:8, padding:'7px 12px', textAlign:'center', minWidth:56 }}>
+                        <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>{l}</div>
+                        <div style={{ fontFamily:"'Fredoka One'", fontSize:15, color:col, marginTop:1 }}>{v}</div>
+                        {l==='BALANCE' && balance < 100 && (
+                          <div style={{ fontSize:7, color:'#ff3366', marginTop:1, fontWeight:800 }}>{balLoss}%</div>
+                        )}
+                      </div>
+                    ))}
+                  </>
+                );
               })()}
             </div>
             <div style={{ display:'flex', gap:6 }}>
@@ -2096,38 +1772,83 @@ export default function App() {
           {/* ── ROW 3: Weights | Learning Log | Bet History ── */}
           <div style={{ flex:1, display:'grid', gridTemplateColumns:'240px 1fr 1fr', gap:7, minHeight:0, overflow:'hidden' }}>
 
-            {/* Weights */}
+            {/* Weights + Signal Accuracy */}
             <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
               <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:12, marginBottom:8, flexShrink:0 }}>⚖️ Live Weights</div>
               <div className="scroll" style={{ flex:1 }}>
-                {Object.entries(weights).sort(([,a],[,b])=>b-a).map(([k,v])=>(
-                  <div key={k} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6 }}>
-                    <span style={{ fontSize:8, color:'#3a3a6a', fontWeight:700, minWidth:90 }}>{k}</span>
-                    <div className="bar" style={{ flex:1, height:5 }}>
-                      <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:v>1.5?'#00e5aa':v<0.7?'#ff3366':'#c44dff', height:'100%', boxShadow:v>1.8?'0 0 5px #00e5aa':v<0.4?'0 0 5px #ff3366':'none', transition:'width .4s ease' }}/>
+                {Object.entries(weights).sort(([,a],[,b])=>b-a).map(([k,v])=>{
+                  // Per-signal accuracy from betHistory
+                  const relBets = betHistory.filter(b=>b.features && b.features[k] !== undefined);
+                  const relWins = relBets.filter(b=>b.correct).length;
+                  const accPct = relBets.length >= 3 ? Math.round(relWins/relBets.length*100) : null;
+                  const trend = v > 1.0 ? 'up' : v < 0.7 ? 'down' : 'flat';
+                  const trendCol = trend==='up'?'#00e5aa':trend==='down'?'#ff3366':'#c44dff';
+                  return (
+                    <div key={k} style={{ display:'flex', alignItems:'center', gap:5, marginBottom:7 }}>
+                      <span style={{ fontSize:8, color:'#3a3a6a', fontWeight:700, minWidth:90 }}>{k}</span>
+                      <div style={{ flex:1 }}>
+                        <div className="bar" style={{ height:5, marginBottom:2 }}>
+                          <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:trendCol, height:'100%', transition:'width .4s ease' }}/>
+                        </div>
+                        {accPct !== null && (
+                          <div style={{ fontSize:7, color: accPct>=55?'#00e5aa':accPct>=45?'#ffd700':'#ff3366' }}>
+                            {relBets.length}bets·{accPct}%acc
+                          </div>
+                        )}
+                      </div>
+                      <span style={{ fontSize:9, fontWeight:800, color:trendCol, minWidth:28 }}>{v.toFixed(2)}</span>
                     </div>
-                    <span style={{ fontSize:9, fontWeight:800, color:v>1.5?'#00e5aa':v<0.7?'#ff3366':'#c44dff', minWidth:28 }}>{v.toFixed(2)}</span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
-            {/* Learning Log */}
+            {/* Learning Log — Timeline */}
             <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
-              <div style={{ fontFamily:"'Fredoka One'", color:'#00e5aa', fontSize:12, marginBottom:8, flexShrink:0 }}>📝 Learning Log</div>
+              <div style={{ fontFamily:"'Fredoka One'", color:'#00e5aa', fontSize:12, marginBottom:8, flexShrink:0, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <span>📝 Learning Log</span>
+                {aiLog.length > 0 && (
+                  <span style={{ fontSize:8, color:'#252550', fontWeight:800 }}>
+                    {aiLog.filter(e=>e.won).length}W / {aiLog.filter(e=>!e.won).length}L
+                  </span>
+                )}
+              </div>
               {aiLog.length===0 ? (
                 <div style={{ flex:1, display:'flex', alignItems:'center', justifyContent:'center', flexDirection:'column', gap:8, color:'#252550', fontSize:10 }}><div style={{fontSize:24}}>🐾</div>Resolve bets to see AI learning</div>
               ) : (
                 <div className="scroll" style={{ flex:1 }}>
-                  {aiLog.map((e,i)=>(
-                    <div key={i} style={{ padding:'6px 0', borderBottom:'1px solid #090920', fontSize:9 }}>
-                      <div style={{ display:'flex', justifyContent:'space-between', marginBottom:1 }}>
-                        <span style={{ color:e.won?'#00e5aa':'#ff3366', fontWeight:800 }}>{e.note}</span>
-                        <span style={{ color:'#252550', fontSize:8 }}>{e.time}</span>
+                  {aiLog.map((e,i)=>{
+                    // Detect streak: count consecutive same outcome before this entry
+                    const streak = (() => {
+                      let s = 1;
+                      for (let j = i+1; j < Math.min(i+5, aiLog.length); j++) {
+                        if (aiLog[j].won === e.won) s++; else break;
+                      }
+                      return s;
+                    })();
+                    const showStreak = streak >= 3 && i === 0;
+                    return (
+                      <div key={i} style={{ display:'flex', gap:7, padding:'6px 0', borderBottom:'1px solid #090920', alignItems:'flex-start' }}>
+                        {/* Time */}
+                        <div style={{ fontSize:7, color:'#252550', minWidth:34, paddingTop:2, flexShrink:0 }}>{e.time?.slice(0,5)}</div>
+                        {/* Outcome pill */}
+                        <div style={{ flexShrink:0, width:28, height:18, borderRadius:9, background:e.won?'rgba(0,229,170,.15)':'rgba(255,51,102,.12)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                          <span style={{ fontSize:8, fontWeight:800, color:e.won?'#00e5aa':'#ff3366' }}>{e.won?'W':'L'}</span>
+                        </div>
+                        {/* Details */}
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ display:'flex', gap:4, alignItems:'center', flexWrap:'wrap' }}>
+                            <span style={{ fontSize:9, fontWeight:800, color:e.direction==='UP'?'#00e5aa':'#ff3366' }}>
+                              {e.direction==='UP'?'▲':'▼'} {e.direction}
+                            </span>
+                            <span style={{ fontSize:8, color:'#3a3a6a' }}>{e.conf}%</span>
+                            {showStreak && <span style={{ fontSize:7, padding:'1px 5px', borderRadius:8, background:e.won?'rgba(0,229,170,.1)':'rgba(255,51,102,.1)', color:e.won?'#00e5aa':'#ff3366', fontWeight:800 }}>{streak}{e.won?'W':'L'} streak</span>}
+                          </div>
+                          <div style={{ fontSize:8, color:e.won?'#1a5a40':'#5a1a2a', marginTop:1 }}>{e.won?'↑ weights reinforced':'↓ weights adjusted'}</div>
+                        </div>
                       </div>
-                      <div style={{ color:'#3a3a6a' }}>{e.direction} · conf:{e.conf}%</div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
