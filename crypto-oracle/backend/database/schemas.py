@@ -18,7 +18,6 @@ class UserOut(BaseModel):
 
     class Config:
         from_attributes = True
-        orm_mode = True
 
 
 class PredictionRequest(BaseModel):
@@ -39,7 +38,6 @@ class PredictionOut(PredictionCreate):
 
     class Config:
         from_attributes = True
-        orm_mode = True
 
 
 class MarketDataOut(BaseModel):
@@ -51,7 +49,6 @@ class MarketDataOut(BaseModel):
 
     class Config:
         from_attributes = True
-        orm_mode = True
 
 
 class TradeSimulationRequest(BaseModel):
@@ -76,4 +73,3 @@ class TradeOut(BaseModel):
 
     class Config:
         from_attributes = True
-        orm_mode = True

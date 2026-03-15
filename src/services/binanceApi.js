@@ -1,25 +1,25 @@
 // ─── BINANCE REST API SERVICE ─────────────────────────────────────────────────
 import { calcMACD, calcRSI, calcStochRSI, calcBB, calcSupertrend, calcVWAP } from '../utils/indicators.js';
 
-const BASE = '/binance/api/v3';
+const API_BASE = import.meta.env?.VITE_API_BASE || 'http://127.0.0.1:8000';
 const TFS = ['1m', '5m', '15m', '30m', '1h', '4h'];
 
 async function fetchKlines(symbol, interval, limit = 200) {
-  const url = `${BASE}/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const url = `${API_BASE}/market/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Binance klines ${interval} failed: ${res.status}`);
   return res.json();
 }
 
 async function fetchTicker(symbol) {
-  const res = await fetch(`${BASE}/ticker/24hr?symbol=${symbol}`);
+  const res = await fetch(`${API_BASE}/market/24hr?symbol=${symbol}`);
   if (!res.ok) throw new Error(`Binance ticker failed: ${res.status}`);
   return res.json();
 }
 
 export async function fetchBTCPrice() {
   try {
-    const res = await fetch(`${BASE}/ticker/price?symbol=BTCUSDT`);
+    const res = await fetch(`${API_BASE}/market/btc`);
     if (!res.ok) throw new Error('price fetch failed');
     const data = await res.json();
     return parseFloat(data.price);

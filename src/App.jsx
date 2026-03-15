@@ -6,7 +6,8 @@ import { subscribePriceStream } from './services/binanceWS.js';
 import { fetchActiveBTCMarket } from './services/polymarketApi.js';
 import { fetchWhaleTransactions, getWhaleSentiment } from './services/whaleMonitor.js';
 import { buildSignal, getMacro, classifyMarket, DEFAULT_WEIGHTS } from './ai/signalEngine.js';
-import { predictDirection, updateWeights } from './ai/predictionModel.js';
+import { updateWeights } from './ai/predictionModel.js';
+import { requestPrediction, simulateTrade } from './services/backendApi.js';
 import CandlestickChart from './charts/CandlestickChart.jsx';
 import QuantPanel from './quant/QuantPanel.jsx';
 import { runQuantEngine } from './quant/quantEngine.js';
@@ -113,6 +114,7 @@ export default function App() {
   const [botCfg, setBotCfg] = useState(() => { try { const s=localStorage.getItem('bd_botCfg'); return s?JSON.parse(s):{minScore:3,minConf:55,useKelly:true,maxConsecLosses:3,stopLoss:20,profitTarget:30}; } catch { return {minScore:3,minConf:55,useKelly:true,maxConsecLosses:3,stopLoss:20,profitTarget:30}; } });
   const [sessionStats, setSessionStats] = useState({ wins:0, losses:0, startBal:100, skipReasons:{rule:0,bayes:0,lmsr:0,balance:0,circuit:0} });
   const autoRef = useRef({ autoBot: false, pred: null, price: null, threshold: null, pendingBet: null, balance: parseFloat(localStorage.getItem('bd_balance')||'100'), fetchedThisRound: false, bettedThisRound: false, betAmt: 5, botCfg: {minScore:3,minConf:55,useKelly:true,maxConsecLosses:3,stopLoss:20,profitTarget:30}, upOdds: 0, dnOdds: 0, tfData: {}, whaleSentiment: {score:0,label:'NEUTRAL'}, oddsHistory: [], spreadData: null, consecLosses: 0, sessionStartBal: parseFloat(localStorage.getItem('bd_balance')||'100'), paused: false });
+  const lastBackendPred = useRef(0);
 
   // ── UI ──
   const [activeTab,    setActiveTab]    = useState('dashboard');
@@ -278,8 +280,23 @@ export default function App() {
     const signal = buildSignal({ tfData, price, upOdds, downOdds: dnOdds, threshold, thresholdSource, dangerous, whale, lowLiq, whaleSentiment, weights, spreadData });
     setPred(signal);
     autoRef.current.pred = signal;
-    const aiP = predictDirection(tfData, price);
-    setAiPred(aiP);
+    const now = Date.now();
+    if (price && now - lastBackendPred.current > 15000) {
+      lastBackendPred.current = now;
+      requestPrediction().then((p) => {
+        if (!p) return;
+        const dir = p.prediction || 'SIDEWAYS';
+        const confPct = Math.round((p.confidence || 0) * 100);
+        setAiPred({
+          dir,
+          conf: confPct,
+          signals: [
+            { label: 'Backend model', val: `${p.symbol} ${p.timeframe}`, bull: dir === 'UP' },
+            { label: 'Confidence', val: `${confPct}%`, bull: dir === 'UP' },
+          ],
+        });
+      });
+    }
     const mkt = classifyMarket(tfData, whaleSentiment);
     setMarket(mkt);
   }, [tfData, price, upOdds, dnOdds, threshold, dangerous, whale, lowLiq, whaleSentiment, weights]);
@@ -365,6 +382,13 @@ export default function App() {
     setBotRoundBet(bet);
     setBalance(b => +(b - amt).toFixed(2));
     setPaperBets(p => [bet, ...p]);
+    simulateTrade({
+      symbol: 'BTCUSDT',
+      side: signal.result === 'UP' ? 'buy' : 'sell',
+      size: amt,
+      entry_price: currentPrice,
+      signal: signal.result === 'UP' ? 'buy' : 'sell',
+    });
     return bet;
   }, [upOdds, dnOdds]);
 
