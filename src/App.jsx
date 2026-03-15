@@ -7,7 +7,7 @@ import { fetchActiveBTCMarket } from './services/polymarketApi.js';
 import { fetchWhaleTransactions, getWhaleSentiment } from './services/whaleMonitor.js';
 import { buildSignal, getMacro, classifyMarket, DEFAULT_WEIGHTS } from './ai/signalEngine.js';
 import { updateWeights } from './ai/predictionModel.js';
-import { requestPrediction, simulateTrade, fetchAiState, saveAiState } from './services/backendApi.js';
+import { requestPrediction, simulateTrade, fetchAiState, saveAiState, fetchRoundInfo } from './services/backendApi.js';
 import CandlestickChart from './charts/CandlestickChart.jsx';
 import QuantPanel from './quant/QuantPanel.jsx';
 import { runQuantEngine } from './quant/quantEngine.js';
@@ -223,14 +223,23 @@ export default function App() {
   const fetchPoly = useCallback(async () => {
     setPolyStatus('🔍 Searching Polymarket...');
     const market = await fetchActiveBTCMarket();
+    const roundInfo = await fetchRoundInfo();
     if (market) {
       setUpOdds(market.upOdds.toString());
       setDnOdds(market.downOdds.toString());
-      if (market.threshold) { setThreshold(market.threshold.toString()); setThresholdSource('real'); }
+      if (market.threshold) {
+        setThreshold(market.threshold.toString());
+        setThresholdSource('real');
+      } else if (roundInfo?.price_to_beat) {
+        setThreshold(roundInfo.price_to_beat.toFixed(2));
+        setThresholdSource('round');
+      }
       if (market.lowLiquidity) setLowLiq(true);
       setPolyRound(market);
-      const srcLabel = market.source === 'clob-live' ? '⚡ LIVE' : '📡 Est';
-      setPolyStatus(`✅ ${srcLabel} ${market.upOdds}¢ UP / ${market.downOdds}¢ DOWN${market.threshold ? ` @ $${market.threshold.toLocaleString()}` : ''}`);
+      const liveSource = ['clob-live', 'polymarket-home'].includes(market.source);
+      const srcLabel = liveSource ? '⚡ LIVE' : '📡 Est';
+      const thresh = market.threshold ?? roundInfo?.price_to_beat;
+      setPolyStatus(`✅ ${srcLabel} ${market.upOdds}¢ UP / ${market.downOdds}¢ DOWN${thresh ? ` @ $${Number(thresh).toLocaleString()}` : ''}`);
       // Enrich with spread + price history (non-blocking)
       if (market.tokenIds?.upId) {
         setEnriching(true);
@@ -241,7 +250,11 @@ export default function App() {
         }).catch(() => setEnriching(false));
       }
     } else {
-      setPolyStatus('⚠️ Polymarket unavailable — backend proxy or market not found. Enter odds manually or wait for Auto.');
+      if (roundInfo?.price_to_beat) {
+        setThreshold(roundInfo.price_to_beat.toFixed(2));
+        setThresholdSource('round');
+      }
+      setPolyStatus('⚠️ Polymarket unavailable — using round-start price. Enter odds manually or wait for Auto.');
     }
   }, []);
 
@@ -1033,10 +1046,10 @@ export default function App() {
               {threshold && (
                 <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4 }}>
                   <div style={{ fontSize:7, fontWeight:800, padding:'2px 8px', borderRadius:10,
-                    background: thresholdSource==='real'?'rgba(0,229,170,.1)':'rgba(255,255,255,.04)',
-                    color: thresholdSource==='real'?'#00e5aa':'#3a3a6a',
-                    border: `1px solid ${thresholdSource==='real'?'#00e5aa33':'#1a1a38'}` }}>
-                    {thresholdSource==='real'?'✅ Real Polymarket threshold':'✏️ Manual entry'}
+                    background: thresholdSource==='real'?'rgba(0,229,170,.1)':thresholdSource==='round'?'rgba(56,212,179,.1)':'rgba(255,255,255,.04)',
+                    color: thresholdSource==='real'?'#00e5aa':thresholdSource==='round'?'#38d4b3':'#3a3a6a',
+                    border: `1px solid ${thresholdSource==='real'?'#00e5aa33':thresholdSource==='round'?'#38d4b333':'#1a1a38'}` }}>
+                    {thresholdSource==='real'?'✅ Real Polymarket threshold':thresholdSource==='round'?'🧭 Round start (Binance)':'✏️ Manual entry'}
                   </div>
                 </div>
               )}

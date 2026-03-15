@@ -108,6 +108,19 @@ def get_recent_market_data(db: Session, symbol: str, limit: int = 200) -> list[m
     )
 
 
+def get_market_data_before(
+    db: Session,
+    symbol: str,
+    timestamp: datetime,
+) -> Optional[models.MarketData]:
+    return (
+        db.query(models.MarketData)
+        .filter(models.MarketData.symbol == symbol, models.MarketData.timestamp <= timestamp)
+        .order_by(models.MarketData.timestamp.desc())
+        .first()
+    )
+
+
 def create_trade(
     db: Session,
     user_id: Optional[int],

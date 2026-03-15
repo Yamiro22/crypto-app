@@ -1,6 +1,7 @@
 import logging
 
 import requests
+from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
@@ -21,6 +22,25 @@ def get_btc_market(db: Session = Depends(get_db)) -> MarketDataOut:
     if item is None:
         raise HTTPException(status_code=404, detail="No market data yet")
     return item
+
+
+@router.get("/market/round")
+def get_round_info(db: Session = Depends(get_db)) -> dict:
+    """Return the current 5-minute round start price (proxy for price-to-beat)."""
+    now = datetime.utcnow()
+    round_start_epoch = int(now.timestamp() // 300 * 300)
+    round_start = datetime.utcfromtimestamp(round_start_epoch)
+    round_end = round_start + timedelta(minutes=5)
+
+    start_tick = crud.get_market_data_before(db, symbol="BTCUSDT", timestamp=round_start)
+    latest = crud.get_latest_market_data(db, symbol="BTCUSDT")
+
+    return {
+        "round_start": round_start.isoformat(),
+        "round_end": round_end.isoformat(),
+        "price_to_beat": start_tick.price if start_tick else (latest.price if latest else None),
+        "current_price": latest.price if latest else None,
+    }
 
 
 @router.get("/market/klines")

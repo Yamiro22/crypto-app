@@ -80,6 +80,10 @@ function isBTCUpDownMarket(q = '') {
   return isBtc && (upDown || isShort);
 }
 
+async function fetchBtc5mHome() {
+  return timedFetch(`${API_BASE}/poly/btc5m`);
+}
+
 function pickBestBTCMarket(markets) {
   const now = Date.now();
   let filtered = markets.filter(m => isBTCUpDownMarket(m.question));
@@ -217,7 +221,27 @@ function saveCachedTokenIds(ids) {
 }
 
 export async function fetchActiveBTCMarket() {
-  // Phase 1: find market
+  // Phase 0: try Polymarket homepage feed (btc-5m-market)
+  try {
+    const home = await fetchBtc5mHome();
+    if (home?.upOdds && home?.downOdds) {
+      return {
+        id: home.marketId,
+        question: home.title || 'BTC 5 Minute Up or Down',
+        upOdds: home.upOdds,
+        downOdds: home.downOdds,
+        liquidity: null,
+        endTime: home.endDate,
+        threshold: null,
+        lowLiquidity: false,
+        source: home.source || 'polymarket-home',
+      };
+    }
+  } catch (e) {
+    console.warn('[Poly/Home]', e.message);
+  }
+
+  // Phase 1: find market (Gamma fallback)
   let market = null;
   try {
     market = await findBTCMarket();

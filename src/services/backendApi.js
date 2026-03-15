@@ -41,6 +41,17 @@ export async function fetchTrades(limit = 50) {
   }
 }
 
+export async function fetchRoundInfo() {
+  try {
+    const res = await fetch(`${API_BASE}/market/round`);
+    if (!res.ok) throw new Error(`round failed: ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.warn('[BackendAPI] round error:', e.message);
+    return null;
+  }
+}
+
 export async function fetchAiState() {
   try {
     const res = await fetch(`${API_BASE}/ai/state`);
