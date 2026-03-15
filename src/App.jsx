@@ -117,6 +117,15 @@ export default function App() {
   // ── UI ──
   const [activeTab,    setActiveTab]    = useState('dashboard');
 
+  // ── New analytics state ──
+  const [balanceHistory,   setBalanceHistory]   = useState(() => { try { return JSON.parse(localStorage.getItem('bd_balHist')||'[]'); } catch{ return []; } });
+  const [signalAccuracy,   setSignalAccuracy]   = useState(() => { try { return JSON.parse(localStorage.getItem('bd_sigAcc')||'{}'); } catch{ return {}; } });
+  const [weightHistory,    setWeightHistory]    = useState(() => { try { return JSON.parse(localStorage.getItem('bd_wHist')||'[]'); } catch{ return []; } });
+  // Confidence deflation factor — starts at 0.85 until 50+ bets calibrated
+  const CALIB_GATE = 50;
+  const isCalibrated = betHistory.length >= CALIB_GATE;
+  const confDeflation = isCalibrated ? 1.0 : 0.85;
+
   const winRate  = betHistory.length ? Math.round(betHistory.filter(b=>b.correct).length/betHistory.length*100) : 0;
   const totalPnL = betHistory.reduce((a,b)=>a+b.pnl, 0);
 
@@ -298,6 +307,9 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('bd_paperBets',  JSON.stringify(paperBets));   } catch{} }, [paperBets]);
   useEffect(() => { try { localStorage.setItem('bd_aiLog',      JSON.stringify(aiLog));       } catch{} }, [aiLog]);
   useEffect(() => { try { localStorage.setItem('bd_pendingBet', JSON.stringify(pendingBet));  } catch{} }, [pendingBet]);
+  useEffect(() => { try { localStorage.setItem('bd_balHist',    JSON.stringify(balanceHistory.slice(-200))); } catch{} }, [balanceHistory]);
+  useEffect(() => { try { localStorage.setItem('bd_sigAcc',     JSON.stringify(signalAccuracy)); } catch{} }, [signalAccuracy]);
+  useEffect(() => { try { localStorage.setItem('bd_wHist',      JSON.stringify(weightHistory.slice(-20))); } catch{} }, [weightHistory]);
 
   // ─── AUTO-BOT ENGINE ─────────────────────────────────────────────────────
   // How it works:
@@ -362,20 +374,41 @@ export default function App() {
     const thresh = parseFloat(bet.threshold) || parseFloat(threshold);
     let won = false;
     if (thresh > 0) {
-      // Real resolution: UP wins if exit price > threshold, DOWN wins if exit price < threshold
       won = bet.direction === 'UP' ? exitPrice > thresh : exitPrice < thresh;
     } else {
-      // Fallback: compare exit price to entry price
       won = bet.direction === 'UP' ? exitPrice > bet.entryPrice : exitPrice < bet.entryPrice;
     }
     const outcome = won ? bet.direction : (bet.direction === 'UP' ? 'DOWN' : 'UP');
     setPaperBets(p => p.map(b => b.id === bet.id ? { ...b, outcome, exitPrice } : b));
+    const pnl = won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount;
     if (won) setBalance(b => +(b + bet.payout).toFixed(2));
+    const newBal = +(autoRef.current.balance + (won ? pnl : 0)).toFixed(2);
+    // Balance history
+    setBalanceHistory(h => [...h, { time: new Date().toLocaleTimeString(), balance: newBal, pnl, won }].slice(-200));
     if (bet.features) {
-      setWeights(w => updateWeights(w, bet.features, won));
-      setAiLog(p => [{ time: new Date().toLocaleTimeString(), won, direction: bet.direction, conf: bet.conf, note: won ? '✅ Auto-bet WIN — weights reinforced' : '🔄 Auto-bet LOSS — weights adjusted' }, ...p.slice(0, 19)]);
+      const oldWeights = {...autoRef.current.weights || {}};
+      setWeights(w => {
+        const nw = updateWeights(w, bet.features, won);
+        // Per-signal accuracy
+        setSignalAccuracy(sa => {
+          const updated = {...sa};
+          Object.keys(bet.features).forEach(sig => {
+            if (!updated[sig]) updated[sig] = {total:0, correct:0};
+            updated[sig].total++;
+            if (won) updated[sig].correct++;
+          });
+          return updated;
+        });
+        // Weight trajectory
+        const wDeltas = {};
+        Object.keys(nw).forEach(k => { const d = +(nw[k] - (w[k]||1)).toFixed(3); if (Math.abs(d) > 0.001) wDeltas[k] = d; });
+        setWeightHistory(h => [...h, { ts: Date.now(), weights: {...nw} }].slice(-20));
+        const regime = getMacro(autoRef.current.tfData || {});
+        setAiLog(p => [{ time: new Date().toLocaleTimeString(), won, direction: bet.direction, conf: bet.conf, odds: bet.odds, pnl, regime, weightDeltas: wDeltas, note: won ? '✅ Auto-bet WIN — weights reinforced' : '🔄 Auto-bet LOSS — weights adjusted' }, ...p.slice(0, 19)]);
+        return nw;
+      });
     }
-    setBetHistory(p => [...p, { correct: won, pnl: won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount, auto: true, ts: Date.now(), bal: +(balance + (won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount)).toFixed(2) }]);
+    setBetHistory(p => [...p, { correct: won, pnl, auto: true, ts: Date.now(), bal: newBal, conf: bet.conf, direction: bet.direction, odds: bet.odds, features: bet.features }]);
     setPendingBet(null);
     setBotRoundBet(null);
     return won;
@@ -475,6 +508,24 @@ export default function App() {
           setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, rule: s.skipReasons.rule + 1 } }));
           setBotStatus('watching');
           return;
+        }
+
+        // ── [0b] FRESH buildSignal() gate — re-run signal engine right now ─
+        // Even if autoRef.current.pred is fresh, re-evaluate with latest odds/data
+        // to catch any skip conditions (skip===true, score too low, etc.)
+        {
+          const freshSignal = buildSignal({ tfData: curTf, price: curPrice, upOdds: curUp, downOdds: curDn, threshold: curThresh, thresholdSource, dangerous, whale, lowLiq, whaleSentiment: curWhale, weights, spreadData: curSpread });
+          if (freshSignal?.skip === true) {
+            botLog_add(`🚫 SIGNAL SKIP — ${freshSignal.reason || 'buildSignal() returned skip=true'}`, 'skip');
+            setSkippedCount(n => n + 1);
+            setSessionStats(s => ({ ...s, skipReasons: { ...s.skipReasons, rule: s.skipReasons.rule + 1 } }));
+            setBotStatus('watching');
+            return;
+          }
+          // Use the fresh signal going forward in this tick
+          if (freshSignal && ['UP','DOWN'].includes(freshSignal.result)) {
+            autoRef.current.pred = freshSignal;
+          }
         }
 
         // ── Balance check ──────────────────────────────────────────────────
@@ -747,13 +798,33 @@ export default function App() {
     const bet = paperBets.find(b => b.id === id); if (!bet) return;
     const outcome = won ? bet.direction : (bet.direction==='UP'?'DOWN':'UP');
     setPaperBets(p => p.map(b => b.id===id ? {...b, outcome} : b));
+    const pnl = won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount;
+    const newBal = +(balance + (won ? pnl : 0)).toFixed(2);
     if (won) setBalance(b => +(b + bet.payout).toFixed(2));
+    // Balance history for P&L curve
+    setBalanceHistory(h => [...h, { time: new Date().toLocaleTimeString(), balance: newBal, pnl, won }].slice(-200));
     if (bet.features) {
+      const oldWeights = {...weights};
       const nw = updateWeights(weights, bet.features, won);
       setWeights(nw);
-      setAiLog(p => [{ time:new Date().toLocaleTimeString(), won, direction:bet.direction, conf:bet.conf, note:won?'✅ Weights reinforced':'🔄 Weights adjusted' }, ...p.slice(0,19)]);
+      // Per-signal accuracy tracking
+      setSignalAccuracy(sa => {
+        const updated = {...sa};
+        Object.keys(bet.features).forEach(sig => {
+          if (!updated[sig]) updated[sig] = {total:0, correct:0};
+          updated[sig].total++;
+          if (won) updated[sig].correct++;
+        });
+        return updated;
+      });
+      // Weight trajectory snapshot
+      const wDeltas = {};
+      Object.keys(nw).forEach(k => { const d = +(nw[k] - (oldWeights[k]||1)).toFixed(3); if (Math.abs(d) > 0.001) wDeltas[k] = d; });
+      setWeightHistory(h => [...h, { ts: Date.now(), weights: {...nw} }].slice(-20));
+      const regime = getMacro(tfData);
+      setAiLog(p => [{ time: new Date().toLocaleTimeString(), won, direction: bet.direction, conf: bet.conf, odds: bet.odds, pnl, regime, weightDeltas: wDeltas, note: won?'✅ Weights reinforced':'🔄 Weights adjusted' }, ...p.slice(0,19)]);
     }
-    setBetHistory(p => { const pnl = won ? +(bet.payout - bet.amount).toFixed(2) : -bet.amount; return [...p, { correct:won, pnl, auto: false, ts: Date.now(), bal: null }]; });
+    setBetHistory(p => { return [...p, { correct:won, pnl, auto:false, ts:Date.now(), bal:newBal, conf:bet.conf, direction:bet.direction, odds:bet.odds, features:bet.features }]; });
     setPendingBet(null);
   };
 
@@ -1320,7 +1391,18 @@ export default function App() {
               {/* ── LEFT: Controls ── */}
               <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
 
-                {/* Main on/off */}
+                {/* Sample gate banner */}
+              {!isCalibrated && (
+                <div style={{ padding:'8px 12px', borderRadius:9, border:'1px solid #ffd70033', background:'rgba(255,213,0,.05)', marginBottom:0 }}>
+                  <div style={{ fontSize:9, color:'#ffd700', fontWeight:800, marginBottom:3 }}>⏳ WARMUP: {betHistory.length}/{CALIB_GATE} bets to calibration</div>
+                  <div className="bar" style={{ height:5, marginBottom:4 }}>
+                    <div className="bar-fill" style={{ width:`${(betHistory.length/CALIB_GATE)*100}%`, background:'linear-gradient(90deg,#ffd700,#ff9d00)', height:'100%' }}/>
+                  </div>
+                  <div style={{ fontSize:8, color:'#3a3a6a' }}>Confidence deflated ×0.85 · weights near defaults · conservative sizing</div>
+                </div>
+              )}
+
+              {/* Main on/off */}
                 <div className="card" style={{ padding:14, border:`2px solid ${autoBot ? '#00e5aa' : '#131328'}`, boxShadow: autoBot ? '0 0 20px rgba(0,229,170,.15)' : 'none' }}>
                   <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:15, marginBottom:4 }}>🤖 Signal Auto-Bot</div>
                   <div style={{ fontSize:10, color:'#3a3a6a', marginBottom:12, lineHeight:1.6 }}>
@@ -1691,7 +1773,6 @@ export default function App() {
                       ['BOT W%', autoBets.length?`${autoWR}%`:'—', autoWRColor],
                       ['P&L', `${totalPnL>=0?'+':''}$${totalPnL.toFixed(2)}`, totalPnL>=0?'#00e5aa':'#ff3366'],
                       ['BALANCE', `$${balance.toFixed(2)}`, balColor],
-                      ['STREAK', streak===0?'—':streak>0?`+${streak}W`:`${Math.abs(streak)}L`, streak>0?'#00e5aa':streak<0?'#ff3366':'#3a3a6a'],
                     ].map(([l,v,col])=>(
                       <div key={l} style={{ background:'#050510', borderRadius:8, padding:'7px 12px', textAlign:'center', minWidth:56 }}>
                         <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>{l}</div>
@@ -1701,13 +1782,27 @@ export default function App() {
                         )}
                       </div>
                     ))}
+                    {/* Streak + mini sparkline dots (last 10 bets) */}
+                    <div style={{ background:'#050510', borderRadius:8, padding:'7px 12px', textAlign:'center', minWidth:70 }}>
+                      <div style={{ fontSize:7, color:'#252550', fontWeight:800, letterSpacing:1 }}>STREAK</div>
+                      <div style={{ fontFamily:"'Fredoka One'", fontSize:15, color:streak>0?'#00e5aa':streak<0?'#ff3366':'#3a3a6a', marginTop:1 }}>
+                        {streak===0?'—':streak>0?`+${streak}W`:`${Math.abs(streak)}L`}
+                      </div>
+                      {betHistory.length >= 2 && (
+                        <div style={{ display:'flex', gap:2, justifyContent:'center', marginTop:3 }} title="Last 10 bets: green=W, red=L">
+                          {betHistory.slice(-10).map((b,i) => (
+                            <div key={i} style={{ width:5, height:5, borderRadius:'50%', background:b.correct?'#00e5aa':'#ff3366', flexShrink:0 }}/>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                   </>
                 );
               })()}
             </div>
             <div style={{ display:'flex', gap:6 }}>
               <button className="btn" onClick={()=>setWeights(DEFAULT_WEIGHTS)} style={{ background:'#08081e', color:'#252560', border:'1px solid #12122e', fontSize:9 }}>Reset Weights</button>
-              <button className="btn" onClick={()=>{ if(!window.confirm('Wipe ALL saved data?')) return; ['bd_weights','bd_balance','bd_betHistory','bd_paperBets','bd_aiLog','bd_pendingBet','bd_botCfg'].forEach(k=>localStorage.removeItem(k)); setWeights(DEFAULT_WEIGHTS); setBalance(100); setBetHistory([]); setPaperBets([]); setAiLog([]); setPendingBet(null); }} style={{ background:'rgba(255,51,102,.08)', color:'#ff3366', border:'1px solid #ff336633', fontSize:9 }}>🗑 Wipe All Data</button>
+              <button className="btn" onClick={()=>{ if(!window.confirm('Wipe ALL saved data?')) return; ['bd_weights','bd_balance','bd_betHistory','bd_paperBets','bd_aiLog','bd_pendingBet','bd_botCfg','bd_balHist','bd_sigAcc','bd_wHist'].forEach(k=>localStorage.removeItem(k)); setWeights(DEFAULT_WEIGHTS); setBalance(100); setBetHistory([]); setPaperBets([]); setAiLog([]); setPendingBet(null); setBalanceHistory([]); setSignalAccuracy({}); setWeightHistory([]); }} style={{ background:'rgba(255,51,102,.08)', color:'#ff3366', border:'1px solid #ff336633', fontSize:9 }}>🗑 Wipe All Data</button>
               <button className="btn" onClick={()=>{
                 const NL = String.fromCharCode(10);
                 const header = 'Time,Direction,Conf,Score,PnL,Balance,Auto';
@@ -1734,21 +1829,26 @@ export default function App() {
                 <div style={{ display:'flex', gap:12, fontSize:8, color:'#3a3a6a' }}>
                   <span>▲ <span style={{color:'#00e5aa'}}>{betHistory.filter(b=>b.correct).length}W</span></span>
                   <span>▼ <span style={{color:'#ff3366'}}>{betHistory.filter(b=>!b.correct).length}L</span></span>
-                  <span>peak: <span style={{color:'#ffd700'}}>${Math.max(...betHistory.map((_,i)=>betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0))).toFixed(2)}</span></span>
+                  <span>peak: <span style={{color:'#ffd700'}}>${Math.max(100,...betHistory.map((_,i)=>100+betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0))).toFixed(2)}</span></span>
                 </div>
               )}
             </div>
             {betHistory.length < 2 ? (
-              <div style={{ height:110, display:'flex', alignItems:'center', justifyContent:'center', color:'#252550', fontSize:10 }}>Place 2+ bets to see curve</div>
+              <div style={{ height:110, display:'flex', alignItems:'center', justifyContent:'center', flexDirection:'column', gap:4, color:'#252550', fontSize:10 }}>
+                <div style={{fontSize:20}}>📈</div>
+                <div>No bets resolved yet — place your first bet to see the curve</div>
+              </div>
             ) : (() => {
-              const curveData = betHistory.map((b,i)=>{
-                const cumPnl = +betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0).toFixed(2);
-                const ts = b.ts ? new Date(b.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}) : `#${i+1}`;
-                return { i: i+1, pnl: cumPnl, ts, win: b.correct };
-              });
-              const minPnl = Math.min(0, ...curveData.map(d=>d.pnl));
-              const maxPnl = Math.max(0, ...curveData.map(d=>d.pnl));
-              const lineCol = curveData[curveData.length-1].pnl >= 0 ? '#00e5aa' : '#ff3366';
+              // Build curve from balanceHistory if available, else compute from betHistory
+              const curveData = balanceHistory.length >= 2
+                ? balanceHistory.map((h,i) => ({ i: i+1, bal: h.balance, ts: h.time?.slice(0,5) || `#${i+1}`, won: h.won }))
+                : betHistory.map((b,i) => {
+                    const cumBal = +(100 + betHistory.slice(0,i+1).reduce((a,x)=>a+x.pnl,0)).toFixed(2);
+                    return { i:i+1, bal:cumBal, ts: b.ts?new Date(b.ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):`#${i+1}`, won:b.correct };
+                  });
+              const minBal = Math.min(95, ...curveData.map(d=>d.bal));
+              const maxBal = Math.max(105, ...curveData.map(d=>d.bal));
+              const lineCol = curveData[curveData.length-1].bal >= 100 ? '#00e5aa' : '#ff3366';
               return (
                 <ResponsiveContainer width="100%" height={110}>
                   <AreaChart data={curveData} margin={{top:4,right:4,bottom:0,left:0}}>
@@ -1759,10 +1859,11 @@ export default function App() {
                       </linearGradient>
                     </defs>
                     <XAxis dataKey="ts" tick={{fontSize:7, fill:'#252550'}} interval={Math.max(0,Math.floor(curveData.length/8)-1)} tickLine={false} axisLine={false}/>
-                    <YAxis domain={[minPnl-1, maxPnl+1]} tick={{fontSize:7, fill:'#252550'}} tickFormatter={v=>`$${v.toFixed(0)}`} tickLine={false} axisLine={false} width={32}/>
-                    <Tooltip contentStyle={{background:'#0a0a1a',border:`1px solid ${lineCol}44`,borderRadius:6,fontSize:9}} formatter={(v,n,p)=>[`$${Number(v).toFixed(2)}`,p.payload?.win?'✅ WIN':'❌ LOSS']} labelFormatter={l=>`Bet: ${l}`}/>
+                    <YAxis domain={[minBal-1, maxBal+1]} tick={{fontSize:7, fill:'#252550'}} tickFormatter={v=>`$${v.toFixed(0)}`} tickLine={false} axisLine={false} width={32}/>
+                    <Tooltip contentStyle={{background:'#0a0a1a',border:`1px solid ${lineCol}44`,borderRadius:6,fontSize:9}} formatter={(v,n,p)=>[`$${Number(v).toFixed(2)}`,p.payload?.won?'✅ WIN':'❌ LOSS']} labelFormatter={l=>`${l}`}/>
+                    <ReferenceLine y={100} stroke="#ffd700" strokeDasharray="4 3" strokeOpacity={0.5} label={{value:'$100 start', fill:'#ffd70088', fontSize:7, position:'right'}}/>
                     <ReferenceLine y={0} stroke="#252550" strokeDasharray="3 3"/>
-                    <Area type="monotone" dataKey="pnl" stroke={lineCol} strokeWidth={2} fill="url(#pnlGrad)" dot={(props)=>{ const{cx,cy,payload}=props; return payload.win ? <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#00e5aa" stroke="none"/> : <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#ff3366" stroke="none"/>; }}/>
+                    <Area type="monotone" dataKey="bal" stroke={lineCol} strokeWidth={2} fill="url(#pnlGrad)" dot={(props)=>{ const{cx,cy,payload}=props; return payload.won ? <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#00e5aa" stroke="none"/> : <circle key={cx} cx={cx} cy={cy} r={2.5} fill="#ff3366" stroke="none"/>; }}/>
                   </AreaChart>
                 </ResponsiveContainer>
               );
@@ -1773,37 +1874,90 @@ export default function App() {
           <div style={{ flex:1, display:'grid', gridTemplateColumns:'240px 1fr 1fr', gap:7, minHeight:0, overflow:'hidden' }}>
 
             {/* Weights + Signal Accuracy */}
-            <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
+            <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
+            <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column', minHeight:0, flex:'0 0 auto', maxHeight:'55%' }}>
               <div style={{ fontFamily:"'Fredoka One'", color:'#c44dff', fontSize:12, marginBottom:8, flexShrink:0 }}>⚖️ Live Weights</div>
               <div className="scroll" style={{ flex:1 }}>
                 {Object.entries(weights).sort(([,a],[,b])=>b-a).map(([k,v])=>{
-                  // Per-signal accuracy from betHistory
                   const relBets = betHistory.filter(b=>b.features && b.features[k] !== undefined);
                   const relWins = relBets.filter(b=>b.correct).length;
                   const accPct = relBets.length >= 3 ? Math.round(relWins/relBets.length*100) : null;
-                  const trend = v > 1.0 ? 'up' : v < 0.7 ? 'down' : 'flat';
-                  const trendCol = trend==='up'?'#00e5aa':trend==='down'?'#ff3366':'#c44dff';
+                  // Trajectory from weightHistory
+                  const wTraj = weightHistory.map(h => h.weights?.[k]).filter(x => x !== undefined);
+                  const trajDir = wTraj.length >= 3 ? (wTraj[wTraj.length-1] > wTraj[0] ? 'up' : wTraj[wTraj.length-1] < wTraj[0] ? 'down' : 'flat') : (v > 1.0 ? 'up' : v < 0.7 ? 'down' : 'flat');
+                  const trendCol = trajDir==='up'?'#00e5aa':trajDir==='down'?'#ff3366':'#c44dff';
+                  const trajBg = trajDir==='up'?'rgba(0,229,170,.05)':trajDir==='down'?'rgba(255,51,102,.05)':'transparent';
                   return (
-                    <div key={k} style={{ display:'flex', alignItems:'center', gap:5, marginBottom:7 }}>
-                      <span style={{ fontSize:8, color:'#3a3a6a', fontWeight:700, minWidth:90 }}>{k}</span>
-                      <div style={{ flex:1 }}>
-                        <div className="bar" style={{ height:5, marginBottom:2 }}>
-                          <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:trendCol, height:'100%', transition:'width .4s ease' }}/>
-                        </div>
-                        {accPct !== null && (
+                    <div key={k} style={{ marginBottom:8, padding:'5px 6px', borderRadius:7, background:trajBg, border:`1px solid ${trendCol}18` }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:3 }}>
+                        <span style={{ fontSize:8, color:'#3a3a6a', fontWeight:700, flex:1 }}>{k}</span>
+                        <span style={{ fontSize:9, fontWeight:800, color:trendCol }}>{v.toFixed(2)}</span>
+                        <button onClick={()=>setWeights(w=>({...w,[k]:DEFAULT_WEIGHTS[k]||1}))}
+                          title={`Reset ${k} to default`}
+                          style={{ fontSize:7, padding:'1px 5px', borderRadius:5, border:`1px solid ${trendCol}44`, background:'transparent', color:trendCol, cursor:'pointer', opacity:.7 }}>↺</button>
+                      </div>
+                      <div className="bar" style={{ height:4, marginBottom:3 }}>
+                        <div className="bar-fill" style={{ width:`${Math.min(100,(v/2)*100)}%`, background:trendCol, height:'100%', transition:'width .4s ease' }}/>
+                      </div>
+                      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                        {accPct !== null ? (
                           <div style={{ fontSize:7, color: accPct>=55?'#00e5aa':accPct>=45?'#ffd700':'#ff3366' }}>
                             {relBets.length}bets·{accPct}%acc
                           </div>
-                        )}
+                        ) : <div/>}
+                        {/* Mini sparkline of weight history */}
+                        {wTraj.length >= 3 && (() => {
+                          const W=50, H=12, last=wTraj.slice(-10);
+                          const mn=Math.min(...last), mx=Math.max(...last), rng=mx-mn||0.01;
+                          const pts=last.map((w,i)=>`${(i/(last.length-1))*W},${H-(((w-mn)/rng)*(H-2)+1)}`).join(' ');
+                          return (
+                            <svg width={W} height={H} style={{display:'block'}}>
+                              <polyline points={pts} fill="none" stroke={trendCol} strokeWidth={1.2} opacity={0.8}/>
+                              <circle cx={(last.length-1)/(last.length-1)*W} cy={H-(((last[last.length-1]-mn)/rng)*(H-2)+1)} r={2} fill={trendCol}/>
+                            </svg>
+                          );
+                        })()}
                       </div>
-                      <span style={{ fontSize:9, fontWeight:800, color:trendCol, minWidth:28 }}>{v.toFixed(2)}</span>
                     </div>
                   );
                 })}
               </div>
             </div>
 
-            {/* Learning Log — Timeline */}
+            {/* Signal Accuracy Table */}
+            {Object.keys(signalAccuracy).length > 0 && (
+              <div className="card" style={{ padding:11, flex:'1 1 0', overflow:'hidden', display:'flex', flexDirection:'column' }}>
+                <div style={{ fontFamily:"'Fredoka One'", color:'#ffd700', fontSize:11, marginBottom:7, flexShrink:0 }}>🎯 Signal Accuracy</div>
+                <div className="scroll" style={{ flex:1 }}>
+                  <table style={{ width:'100%', borderCollapse:'collapse', fontSize:8 }}>
+                    <thead>
+                      <tr>{['Signal','Preds','Correct','Acc%'].map(h=>(
+                        <th key={h} style={{ textAlign:'left', color:'#252550', fontWeight:800, paddingBottom:4, letterSpacing:.5 }}>{h}</th>
+                      ))}</tr>
+                    </thead>
+                    <tbody>
+                      {Object.entries(signalAccuracy)
+                        .sort(([,a],[,b])=>b.total-a.total)
+                        .map(([sig,{total,correct}])=>{
+                          const acc = Math.round(correct/total*100);
+                          const col = acc>=55?'#00e5aa':acc>=45?'#ffd700':'#ff3366';
+                          return (
+                            <tr key={sig} style={{ borderTop:'1px solid #090920' }}>
+                              <td style={{ padding:'3px 0', color:'#6060a0', fontWeight:700 }}>{sig}</td>
+                              <td style={{ color:'#3a3a6a' }}>{total}</td>
+                              <td style={{ color:'#3a3a6a' }}>{correct}</td>
+                              <td style={{ color:col, fontWeight:800 }}>{acc}%</td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            </div>{/* end weights column wrapper */}
+
+            {/* Learning Log — Timeline with regime clusters */}
             <div className="card" style={{ padding:12, overflow:'hidden', display:'flex', flexDirection:'column' }}>
               <div style={{ fontFamily:"'Fredoka One'", color:'#00e5aa', fontSize:12, marginBottom:8, flexShrink:0, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
                 <span>📝 Learning Log</span>
@@ -1818,33 +1972,56 @@ export default function App() {
               ) : (
                 <div className="scroll" style={{ flex:1 }}>
                   {aiLog.map((e,i)=>{
-                    // Detect streak: count consecutive same outcome before this entry
-                    const streak = (() => {
-                      let s = 1;
-                      for (let j = i+1; j < Math.min(i+5, aiLog.length); j++) {
-                        if (aiLog[j].won === e.won) s++; else break;
-                      }
-                      return s;
-                    })();
-                    const showStreak = streak >= 3 && i === 0;
+                    const streak = (() => { let s=1; for(let j=i+1;j<Math.min(i+5,aiLog.length);j++){if(aiLog[j].won===e.won)s++;else break;} return s; })();
+                    const showStreak = streak >= 3 && (i === 0 || aiLog[i-1]?.won !== e.won);
+                    const isConsecLoss = !e.won && streak >= 2;
+                    // Regime label cluster header — show when regime changes
+                    const prevRegime = i < aiLog.length-1 ? aiLog[i+1]?.regime : null;
+                    const showRegime = e.regime && e.regime !== prevRegime;
+                    const regimeCol = e.regime==='BULLISH'?'#00e5aa':e.regime==='BEARISH'?'#ff3366':'#ffd700';
+                    const regimeLabel = e.regime==='BULLISH'?'🐂 BULL TREND':e.regime==='BEARISH'?'🐻 BEAR TREND':'⚠️ CHOPPY';
                     return (
-                      <div key={i} style={{ display:'flex', gap:7, padding:'6px 0', borderBottom:'1px solid #090920', alignItems:'flex-start' }}>
-                        {/* Time */}
-                        <div style={{ fontSize:7, color:'#252550', minWidth:34, paddingTop:2, flexShrink:0 }}>{e.time?.slice(0,5)}</div>
-                        {/* Outcome pill */}
-                        <div style={{ flexShrink:0, width:28, height:18, borderRadius:9, background:e.won?'rgba(0,229,170,.15)':'rgba(255,51,102,.12)', display:'flex', alignItems:'center', justifyContent:'center' }}>
-                          <span style={{ fontSize:8, fontWeight:800, color:e.won?'#00e5aa':'#ff3366' }}>{e.won?'W':'L'}</span>
-                        </div>
-                        {/* Details */}
-                        <div style={{ flex:1, minWidth:0 }}>
-                          <div style={{ display:'flex', gap:4, alignItems:'center', flexWrap:'wrap' }}>
-                            <span style={{ fontSize:9, fontWeight:800, color:e.direction==='UP'?'#00e5aa':'#ff3366' }}>
-                              {e.direction==='UP'?'▲':'▼'} {e.direction}
-                            </span>
-                            <span style={{ fontSize:8, color:'#3a3a6a' }}>{e.conf}%</span>
-                            {showStreak && <span style={{ fontSize:7, padding:'1px 5px', borderRadius:8, background:e.won?'rgba(0,229,170,.1)':'rgba(255,51,102,.1)', color:e.won?'#00e5aa':'#ff3366', fontWeight:800 }}>{streak}{e.won?'W':'L'} streak</span>}
+                      <div key={i}>
+                        {showRegime && (
+                          <div style={{ fontSize:7, color:regimeCol, fontWeight:800, letterSpacing:1, padding:'4px 0 2px', opacity:.7 }}>{regimeLabel}</div>
+                        )}
+                        <div style={{ display:'flex', gap:6, padding:'5px 0', borderBottom:'1px solid #090920', alignItems:'flex-start',
+                          background: isConsecLoss ? 'rgba(255,51,102,.03)' : 'transparent',
+                          borderLeft: isConsecLoss ? '2px solid #ff336633' : '2px solid transparent', paddingLeft: isConsecLoss ? 4 : 0 }}>
+                          {/* Time */}
+                          <div style={{ fontSize:7, color:'#252550', minWidth:32, paddingTop:2, flexShrink:0 }}>{e.time?.slice(0,5)}</div>
+                          {/* Outcome pill */}
+                          <div style={{ flexShrink:0, width:26, height:17, borderRadius:8, background:e.won?'rgba(0,229,170,.15)':'rgba(255,51,102,.12)', display:'flex', alignItems:'center', justifyContent:'center' }}>
+                            <span style={{ fontSize:8, fontWeight:800, color:e.won?'#00e5aa':'#ff3366' }}>{e.won?'W':'L'}</span>
                           </div>
-                          <div style={{ fontSize:8, color:e.won?'#1a5a40':'#5a1a2a', marginTop:1 }}>{e.won?'↑ weights reinforced':'↓ weights adjusted'}</div>
+                          {/* Details */}
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ display:'flex', gap:3, alignItems:'center', flexWrap:'wrap', justifyContent:'space-between' }}>
+                              <div style={{ display:'flex', gap:3, alignItems:'center' }}>
+                                <span style={{ fontSize:9, fontWeight:800, color:e.direction==='UP'?'#00e5aa':'#ff3366' }}>
+                                  {e.direction==='UP'?'▲':'▼'} {e.direction}
+                                </span>
+                                {e.odds && <span style={{ fontSize:7, color:'#3a3a6a' }}>{e.odds}¢</span>}
+                                <span style={{ fontSize:7, color:'#3a3a6a' }}>{e.conf}%</span>
+                                {showStreak && <span style={{ fontSize:7, padding:'1px 4px', borderRadius:7, background:e.won?'rgba(0,229,170,.1)':'rgba(255,51,102,.1)', color:e.won?'#00e5aa':'#ff3366', fontWeight:800 }}>{streak}{e.won?'W':'L'}</span>}
+                              </div>
+                              {e.pnl !== undefined && (
+                                <span style={{ fontSize:8, fontWeight:800, color:e.pnl>=0?'#00e5aa':'#ff3366', flexShrink:0 }}>
+                                  {e.pnl>=0?'+':''}{e.pnl?.toFixed(2)}
+                                </span>
+                              )}
+                            </div>
+                            {/* Weight deltas */}
+                            {e.weightDeltas && Object.keys(e.weightDeltas).length > 0 && (
+                              <div style={{ display:'flex', gap:3, flexWrap:'wrap', marginTop:2 }}>
+                                {Object.entries(e.weightDeltas).slice(0,3).map(([k,d]) => (
+                                  <span key={k} style={{ fontSize:6, padding:'0 4px', borderRadius:5, background:d>0?'rgba(0,229,170,.08)':'rgba(255,51,102,.08)', color:d>0?'#00e5aa99':'#ff336699' }}>
+                                    {k}: {d>0?'+':''}{d}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
                         </div>
                       </div>
                     );
@@ -1878,6 +2055,96 @@ export default function App() {
               )}
             </div>
           </div>{/* end ROW 3 grid */}
+
+          {/* ── ROW 4: Confidence Calibration + Sample Gate ── */}
+          <div style={{ display:'flex', gap:7, flexShrink:0 }}>
+
+            {/* Confidence Calibration Chart */}
+            <div className="card" style={{ flex:1, padding:'10px 14px' }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:7 }}>
+                <div style={{ fontFamily:"'Fredoka One'", color:'#ff9d00', fontSize:12 }}>🎯 Confidence Calibration</div>
+                {!isCalibrated && <div style={{ fontSize:8, color:'#ff9d00', fontWeight:800 }}>×{confDeflation} deflation active until {CALIB_GATE} bets</div>}
+              </div>
+              {betHistory.length < 5 ? (
+                <div style={{ fontSize:9, color:'#252550', padding:'8px 0' }}>Need 5+ bets for calibration data</div>
+              ) : (() => {
+                const buckets = [
+                  {label:'50-55%', min:50, max:55},
+                  {label:'55-60%', min:55, max:60},
+                  {label:'60-65%', min:60, max:65},
+                  {label:'65-70%', min:65, max:70},
+                  {label:'70-75%', min:70, max:75},
+                ];
+                return (
+                  <div style={{ display:'flex', gap:6, alignItems:'flex-end' }}>
+                    {buckets.map(({label,min,max}) => {
+                      const bkBets = betHistory.filter(b => b.conf >= min && b.conf < max);
+                      if (!bkBets.length) return (
+                        <div key={label} style={{ flex:1, textAlign:'center' }}>
+                          <div style={{ height:60, display:'flex', alignItems:'center', justifyContent:'center', color:'#1a1a38', fontSize:8 }}>—</div>
+                          <div style={{ fontSize:7, color:'#252550', marginTop:3 }}>{label}</div>
+                          <div style={{ fontSize:7, color:'#1a1a38' }}>0 bets</div>
+                        </div>
+                      );
+                      const wr = Math.round(bkBets.filter(b=>b.correct).length/bkBets.length*100);
+                      const barH = Math.max(4, Math.round(wr * 0.6));
+                      const expectedH = Math.round(((min+max)/2) * 0.6);
+                      const col = wr >= min ? '#00e5aa' : wr >= 45 ? '#ffd700' : '#ff3366';
+                      return (
+                        <div key={label} style={{ flex:1, textAlign:'center' }}>
+                          <div style={{ height:60, display:'flex', alignItems:'flex-end', justifyContent:'center', gap:2, position:'relative' }}>
+                            {/* Expected bar (ghost) */}
+                            <div style={{ position:'absolute', bottom:0, left:'50%', transform:'translateX(-50%)', width:12, height:expectedH, background:'#252550', borderRadius:'3px 3px 0 0', opacity:.4 }}/>
+                            {/* Actual bar */}
+                            <div style={{ position:'relative', width:12, height:barH, background:col, borderRadius:'3px 3px 0 0', zIndex:1 }}/>
+                            <div style={{ position:'absolute', top:0, fontSize:8, fontWeight:800, color:col }}>{wr}%</div>
+                          </div>
+                          <div style={{ fontSize:7, color:'#252550', marginTop:3 }}>{label}</div>
+                          <div style={{ fontSize:7, color:'#3a3a6a' }}>{bkBets.length}b</div>
+                        </div>
+                      );
+                    })}
+                    <div style={{ fontSize:7, color:'#3a3a6a', alignSelf:'center', marginLeft:4, lineHeight:1.8 }}>
+                      <div style={{ display:'flex', alignItems:'center', gap:3, marginBottom:2 }}><div style={{width:10,height:8,background:'#252550',borderRadius:2,opacity:.5}}/> expected</div>
+                      <div style={{ display:'flex', alignItems:'center', gap:3 }}><div style={{width:10,height:8,background:'#00e5aa',borderRadius:2}}/> actual</div>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+
+            {/* Sample Gate Progress */}
+            <div className="card" style={{ width:220, padding:'10px 14px' }}>
+              <div style={{ fontFamily:"'Fredoka One'", color:isCalibrated?'#00e5aa':'#ffd700', fontSize:12, marginBottom:7 }}>
+                {isCalibrated ? '✅ Engine Calibrated' : '⏳ Warmup Mode'}
+              </div>
+              {isCalibrated ? (
+                <div style={{ fontSize:9, color:'#3a3a6a', lineHeight:1.8 }}>
+                  <div>✅ {betHistory.length} bets resolved</div>
+                  <div>✅ Adaptive weights active</div>
+                  <div>✅ Full Kelly sizing enabled</div>
+                  <div style={{ marginTop:6, fontSize:8, color:'#252550' }}>Engine has passed the {CALIB_GATE}-bet calibration gate</div>
+                </div>
+              ) : (
+                <>
+                  <div style={{ fontSize:9, color:'#ffd700', fontWeight:800, marginBottom:8 }}>
+                    {betHistory.length}/{CALIB_GATE} rounds to calibration — paper mode
+                  </div>
+                  <div className="bar" style={{ height:8, marginBottom:8 }}>
+                    <div className="bar-fill" style={{ width:`${(betHistory.length/CALIB_GATE)*100}%`, background:'linear-gradient(90deg,#ffd700,#ff9d00)', height:'100%', borderRadius:4 }}/>
+                  </div>
+                  <div style={{ fontSize:8, color:'#3a3a6a', lineHeight:1.8 }}>
+                    <div>⚠️ Weights still near defaults</div>
+                    <div>⚠️ Confidence deflated ×0.85</div>
+                    <div>⚠️ Kelly sizing conservative</div>
+                  </div>
+                  <button className="btn" onClick={()=>{ if(!window.confirm(`Reset calibration? This won't delete bets, just resets the gate counter. You have ${betHistory.length} bets of history.`)) return; }} style={{ marginTop:8, width:'100%', background:'rgba(255,213,0,.06)', color:'#ffd700', border:'1px solid #ffd70022', fontSize:8, padding:'5px' }}>
+                    ⚠️ Reset Calibration Gate
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
