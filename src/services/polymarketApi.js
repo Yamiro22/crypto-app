@@ -12,6 +12,7 @@
 //   /polymarket-clob/... → https://clob.polymarket.com/...
 
 const TIMEOUT_MS = 5000;
+const API_BASE = import.meta.env?.VITE_API_BASE || 'http://127.0.0.1:8000';
 
 // ── Auth headers (available for future order endpoints) ───────────────────
 export function getAuthHeaders() {
@@ -50,8 +51,8 @@ async function timedFetch(url, opts = {}) {
 
 async function findBTCMarket() {
   const urls = [
-    '/polymarket/markets?tag=bitcoin&active=true&closed=false&limit=30',
-    '/polymarket/markets?search=bitcoin+up+down+5&active=true&limit=30',
+    `${API_BASE}/poly/markets?tag=bitcoin&active=true&closed=false&limit=30`,
+    `${API_BASE}/poly/markets?search=bitcoin+up+down+5&active=true&limit=30`,
   ];
   for (const url of urls) {
     try {
@@ -120,8 +121,8 @@ function extractTokenIds(market) {
 // /book can return stale data for some markets — avoid for odds.
 async function fetchLiveOdds(upId, downId) {
   const [upData, downData] = await Promise.all([
-    timedFetch(`/polymarket-clob/price?token_id=${upId}&side=BUY`),
-    timedFetch(`/polymarket-clob/price?token_id=${downId}&side=BUY`),
+    timedFetch(`${API_BASE}/clob/price?token_id=${upId}&side=BUY`),
+    timedFetch(`${API_BASE}/clob/price?token_id=${downId}&side=BUY`),
   ]);
   const upOdds   = Math.round(parseFloat(upData.price   || 0.5) * 100);
   const downOdds = Math.round(parseFloat(downData.price || 0.5) * 100);
@@ -134,7 +135,7 @@ async function fetchLiveOdds(upId, downId) {
 export async function fetchSpreadSignal(tokenId) {
   if (!tokenId) return null;
   try {
-    const data        = await timedFetch(`/polymarket-clob/spread?token_id=${tokenId}`);
+    const data        = await timedFetch(`${API_BASE}/clob/spread?token_id=${tokenId}`);
     const bid         = parseFloat(data.bid  || 0);
     const ask         = parseFloat(data.ask  || 0);
     const spreadCents = +((ask - bid) * 100).toFixed(2);
@@ -143,7 +144,7 @@ export async function fetchSpreadSignal(tokenId) {
     // only for imbalance direction, not exact values)
     let imbalance = 0;
     try {
-      const book     = await timedFetch(`/polymarket-clob/book?token_id=${tokenId}`);
+      const book     = await timedFetch(`${API_BASE}/clob/book?token_id=${tokenId}`);
       const bidDepth = (book.bids || []).slice(0, 5).reduce((a, b) => a + parseFloat(b.size || 0), 0);
       const askDepth = (book.asks || []).slice(0, 5).reduce((a, b) => a + parseFloat(b.size || 0), 0);
       const total    = bidDepth + askDepth;
@@ -166,7 +167,7 @@ export async function fetchSpreadSignal(tokenId) {
 export async function fetchOddsHistory(tokenId) {
   if (!tokenId) return [];
   try {
-    const data    = await timedFetch(`/polymarket-clob/prices-history?market=${tokenId}&interval=1h&fidelity=1`);
+    const data    = await timedFetch(`${API_BASE}/clob/prices-history?market=${tokenId}&interval=1h&fidelity=1`);
     const history = data.history || data || [];
     return history.map(pt => ({
       t:    pt.t * 1000,
@@ -304,6 +305,6 @@ function extractGammaOdds(market) {
 }
 
 export async function fetchMarketHistory(marketId) {
-  try { return await timedFetch(`/polymarket/markets/${marketId}/history`); }
+  try { return await timedFetch(`${API_BASE}/poly/markets/${marketId}/history`); }
   catch (e) { console.warn('[Poly/History]', e.message); return null; }
 }

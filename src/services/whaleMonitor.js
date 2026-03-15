@@ -4,7 +4,7 @@
 
 const WHALE_API_KEY = 'YOUR_WHALE_ALERT_API_KEY'; // Replace with real key
 const MIN_VALUE_USD = 5_000_000; // $5M+ transfers
-const BASE = '/whale/v1';
+const API_BASE = import.meta.env?.VITE_API_BASE || 'http://127.0.0.1:8000';
 
 // Cache to avoid duplicate entries
 const seenIds = new Set();
@@ -19,7 +19,7 @@ export async function fetchWhaleTransactions() {
       return generateDemoWhales();
     }
 
-    const res = await fetch(`${BASE}/transactions?min_value=${MIN_VALUE_USD}&start=${start}&api_key=${WHALE_API_KEY}&currency=btc&limit=20`);
+    const res = await fetch(`${API_BASE}/whale/transactions?min_value=${MIN_VALUE_USD}&start=${start}&currency=btc&limit=20`);
     if (!res.ok) throw new Error(`Whale API ${res.status}`);
     const data = await res.json();
     const txs = (data.transactions || [])

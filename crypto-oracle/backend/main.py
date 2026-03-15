@@ -14,6 +14,7 @@ from backend.api.market_routes import router as legacy_market_router
 from backend.api.signal_routes import router as legacy_signal_router
 from backend.api.trade_routes import router as legacy_trade_router
 from backend.api.whale_routes import router as legacy_whale_router
+from backend.api.proxy import router as proxy_router
 
 logging.basicConfig(level=LOG_LEVEL)
 logger = logging.getLogger("crypto_oracle")
@@ -23,7 +24,8 @@ market_service = MarketService()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -52,6 +54,7 @@ app.include_router(health_router)
 app.include_router(market_router)
 app.include_router(prediction_router)
 app.include_router(trading_router)
+app.include_router(proxy_router)
 app.include_router(legacy_market_router)
 app.include_router(legacy_signal_router)
 app.include_router(legacy_trade_router)
