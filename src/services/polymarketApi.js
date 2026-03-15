@@ -51,8 +51,11 @@ async function timedFetch(url, opts = {}) {
 
 async function findBTCMarket() {
   const urls = [
-    `${API_BASE}/poly/markets?tag=bitcoin&active=true&closed=false&limit=30`,
-    `${API_BASE}/poly/markets?search=bitcoin+up+down+5&active=true&limit=30`,
+    `${API_BASE}/poly/markets?tag=bitcoin&active=true&closed=false&limit=50`,
+    `${API_BASE}/poly/markets?search=bitcoin+up+down+5+min&active=true&closed=false&limit=100`,
+    `${API_BASE}/poly/markets?search=bitcoin+price+5+min&active=true&closed=false&limit=100`,
+    `${API_BASE}/poly/markets?search=btc+up+down+5m&active=true&closed=false&limit=100`,
+    `${API_BASE}/poly/markets?search=bitcoin&active=true&closed=false&limit=200`,
   ];
   for (const url of urls) {
     try {
@@ -69,15 +72,23 @@ async function findBTCMarket() {
 
 function isBTCUpDownMarket(q = '') {
   const lq = q.toLowerCase();
-  return (lq.includes('bitcoin') || lq.includes('btc'))
-    && (lq.includes('up or down') || lq.includes('up/down')
-        || lq.includes('higher or lower') || lq.includes('5 min') || lq.includes('5min'));
+  const isBtc = lq.includes('bitcoin') || lq.includes('btc');
+  const isShort = lq.includes('5 min') || lq.includes('5-minute') || lq.includes('5m')
+    || lq.includes('5 minutes') || lq.includes('next 5') || lq.includes('in 5');
+  const upDown = lq.includes('up or down') || lq.includes('up/down')
+    || lq.includes('higher or lower') || lq.includes('above') || lq.includes('below');
+  return isBtc && (upDown || isShort);
 }
 
 function pickBestBTCMarket(markets) {
   const now = Date.now();
-  return markets
-    .filter(m => isBTCUpDownMarket(m.question))
+  let filtered = markets.filter(m => isBTCUpDownMarket(m.question));
+  if (filtered.length === 0) {
+    filtered = markets.filter(m => /bitcoin|btc/i.test(m.question || ''));
+  }
+  if (filtered.length === 0) return null;
+
+  return filtered
     .map(m => {
       const endMs    = new Date(m.end_date_iso || m.endDate || m.endDateIso || 0).getTime();
       const minsLeft = (endMs - now) / 60000;

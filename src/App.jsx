@@ -7,47 +7,69 @@ import { fetchActiveBTCMarket } from './services/polymarketApi.js';
 import { fetchWhaleTransactions, getWhaleSentiment } from './services/whaleMonitor.js';
 import { buildSignal, getMacro, classifyMarket, DEFAULT_WEIGHTS } from './ai/signalEngine.js';
 import { updateWeights } from './ai/predictionModel.js';
-import { requestPrediction, simulateTrade } from './services/backendApi.js';
+import { requestPrediction, simulateTrade, fetchAiState, saveAiState } from './services/backendApi.js';
 import CandlestickChart from './charts/CandlestickChart.jsx';
 import QuantPanel from './quant/QuantPanel.jsx';
 import { runQuantEngine } from './quant/quantEngine.js';
 
 // ─── STYLES ──────────────────────────────────────────────────────────────────
 const CSS = `
-  @import url('https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@600;700;800;900&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=Space+Grotesk:wght@400;500;600;700&family=Fredoka+One&display=swap');
+  :root{
+    --bg-dark:#0a0b10;
+    --panel-dark:#14161f;
+    --accent-amber:#f2994a;
+    --accent-teal:#38d4b3;
+    --neon-green:#00ff94;
+    --neon-red:#ff4b2b;
+    --text-main:#e8e8f2;
+    --text-muted:#8b8fa3;
+  }
   *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
-  html,body,#root{width:100vw;height:100vh;overflow:hidden;background:#050510;}
-  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:#050510}::-webkit-scrollbar-thumb{background:#ff6d00;border-radius:2px}
+  html,body,#root{width:100vw;height:100vh;overflow:hidden;background:var(--bg-dark);}
+  body{font-family:'Space Grotesk',sans-serif;color:var(--text-main);background:
+    radial-gradient(1200px 600px at 20% -10%, rgba(242,153,74,.08), transparent 50%),
+    radial-gradient(900px 500px at 90% 0%, rgba(56,212,179,.08), transparent 50%),
+    var(--bg-dark);
+  }
+  ::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg-dark)}::-webkit-scrollbar-thumb{background:#2a2d3a;border-radius:10px}
   @keyframes pounce{0%,100%{transform:translateY(0)}50%{transform:translateY(-4px)}}
   @keyframes spin{to{transform:rotate(360deg)}}
-  @keyframes glow{0%,100%{box-shadow:0 0 6px rgba(255,109,0,.2)}50%{box-shadow:0 0 18px rgba(255,109,0,.5)}}
+  @keyframes glow{0%,100%{box-shadow:0 0 10px rgba(242,153,74,.2)}50%{box-shadow:0 0 24px rgba(242,153,74,.45)}}
   @keyframes slideUp{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
   @keyframes flash{0%,100%{opacity:1}50%{opacity:.25}}
-  @keyframes tickUp{from{color:#00e5aa}to{color:#e0e0ff}}
-  @keyframes tickDown{from{color:#ff3366}to{color:#e0e0ff}}
-  .card{background:#0a0a1a;border:1px solid #131328;border-radius:11px;}
-  .tf-card{background:#07071a;border:1px solid #0f0f26;border-radius:9px;padding:9px;transition:transform .2s;}
+  @keyframes pulse{0%{transform:scale(.95);opacity:.6}50%{transform:scale(1);opacity:1}100%{transform:scale(.95);opacity:.6}}
+  .glass-panel,.card{background:rgba(20,22,31,.86);backdrop-filter:blur(10px);border:1px solid rgba(255,255,255,.06);border-radius:16px;}
+  .tf-card{background:linear-gradient(145deg,#1a1c26,#14161f);border:1px solid rgba(255,255,255,.05);border-radius:12px;padding:10px;transition:transform .2s;}
   .tf-card:hover{transform:translateY(-2px);}
-  .inp{background:#050510;border:1.5px solid #141430;border-radius:7px;color:#e0e0ff;padding:7px 10px;font-family:'Nunito',sans-serif;font-size:12px;font-weight:800;width:100%;outline:none;transition:border-color .2s;}
-  .inp:focus{border-color:#ff6d00;}
-  .inp::placeholder{color:#1e1e40;font-weight:600;}
-  .flag{border:none;padding:5px 9px;border-radius:14px;cursor:pointer;font-family:'Nunito',sans-serif;font-weight:800;font-size:10px;transition:all .2s;}
+  .inp{background:#0e1018;border:1.5px solid rgba(255,255,255,.08);border-radius:10px;color:var(--text-main);padding:8px 10px;font-family:'Space Grotesk',sans-serif;font-size:12px;font-weight:600;width:100%;outline:none;transition:border-color .2s;}
+  .inp:focus{border-color:rgba(242,153,74,.6);}
+  .inp::placeholder{color:#34384c;font-weight:600;}
+  .flag{border:none;padding:5px 9px;border-radius:14px;cursor:pointer;font-family:'Space Grotesk',sans-serif;font-weight:700;font-size:10px;transition:all .2s;}
   .flag:hover{transform:scale(1.05);}
-  .btn{border:none;border-radius:8px;cursor:pointer;font-family:'Fredoka One',sans-serif;font-size:12px;padding:8px 14px;transition:all .2s;letter-spacing:.4px;}
-  .btn:hover:not(:disabled){transform:scale(1.03);}
-  .btn:disabled{opacity:.3;cursor:not-allowed;transform:none;}
-  .tab{background:none;border:none;cursor:pointer;font-family:'Fredoka One',sans-serif;font-size:11px;padding:6px 10px;border-radius:6px;transition:all .2s;white-space:nowrap;}
-  .bar{height:4px;border-radius:2px;background:#0e0e26;overflow:hidden;}
+  .btn{border:none;border-radius:10px;cursor:pointer;font-family:'Sora',sans-serif;font-size:12px;padding:9px 14px;transition:all .2s;letter-spacing:.4px;}
+  .btn:hover:not(:disabled){transform:translateY(-1px);}
+  .btn:disabled{opacity:.35;cursor:not-allowed;transform:none;}
+  .nav-btn{background:none;border:none;cursor:pointer;font-family:'Sora',sans-serif;font-size:12px;padding:6px 10px;border-radius:8px;transition:all .2s;white-space:nowrap;color:var(--text-muted);position:relative;}
+  .nav-btn.active{color:var(--accent-amber);}
+  .nav-btn.active::after{content:'';position:absolute;left:0;bottom:-6px;width:100%;height:2px;background:var(--accent-amber);box-shadow:0 0 10px rgba(242,153,74,.6);}
+  .bar{height:4px;border-radius:2px;background:#0f111b;overflow:hidden;}
   .bar-fill{height:100%;border-radius:2px;transition:width .5s;}
   .pred-glow{animation:glow 2s ease-in-out infinite;}
   .paw{animation:pounce 1.5s ease-in-out infinite;}
   .spin{animation:spin 1s linear infinite;display:inline-block;}
   .flash{animation:flash .8s ease-in-out infinite;}
+  .pulse{animation:pulse 2s infinite;}
   .slide{animation:slideUp .3s ease;}
   .scroll{overflow-y:auto;}
-  .scroll::-webkit-scrollbar{width:3px;}
-  .live-dot{width:7px;height:7px;border-radius:50%;background:#00e5aa;animation:flash 1s infinite;}
-  .dead-dot{width:7px;height:7px;border-radius:50%;background:#ff3366;}
+  .scroll::-webkit-scrollbar{width:4px;}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:var(--neon-green);animation:flash 1s infinite;}
+  .dead-dot{width:7px;height:7px;border-radius:50%;background:var(--neon-red);}
+  .signal-up{color:var(--neon-green);text-shadow:0 0 10px rgba(0,255,148,.3);}
+  .signal-down{color:var(--neon-red);text-shadow:0 0 10px rgba(255,75,43,.3);}
+  .stat-card{background:linear-gradient(145deg,#1a1c26,#14161f);border-radius:12px;padding:10px;border:1px solid rgba(255,255,255,.04);}
+  .dash-grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:16px;padding:16px;min-height:0;overflow:hidden;}
+  @media (max-width:1100px){.dash-grid{grid-template-columns:1fr}.dash-col{grid-column:span 12}}
 `;
 
 const TFS = ['1m','5m','15m','30m','1h','4h'];
@@ -75,7 +97,7 @@ export default function App() {
   const [upOdds,  setUpOdds]   = useState('');
   const [dnOdds,  setDnOdds]   = useState('');
   const [threshold,setThreshold]=useState('');
-  const [thresholdSource,setThresholdSource]=useState(''); // 'real' | 'smartfill' | ''
+  const [thresholdSource,setThresholdSource]=useState(''); // 'real' | ''
   const [dangerous,setDangerous]=useState(false);
   const [whale,    setWhale]    = useState(false);
   const [lowLiq,   setLowLiq]  = useState(false);
@@ -115,9 +137,10 @@ export default function App() {
   const [sessionStats, setSessionStats] = useState({ wins:0, losses:0, startBal:100, skipReasons:{rule:0,bayes:0,lmsr:0,balance:0,circuit:0} });
   const autoRef = useRef({ autoBot: false, pred: null, price: null, threshold: null, pendingBet: null, balance: parseFloat(localStorage.getItem('bd_balance')||'100'), fetchedThisRound: false, bettedThisRound: false, betAmt: 5, botCfg: {minScore:3,minConf:55,useKelly:true,maxConsecLosses:3,stopLoss:20,profitTarget:30}, upOdds: 0, dnOdds: 0, tfData: {}, whaleSentiment: {score:0,label:'NEUTRAL'}, oddsHistory: [], spreadData: null, consecLosses: 0, sessionStartBal: parseFloat(localStorage.getItem('bd_balance')||'100'), paused: false });
   const lastBackendPred = useRef(0);
+  const aiStateLoaded = useRef(false);
 
   // ── UI ──
-  const [activeTab,    setActiveTab]    = useState('dashboard');
+  const [activeTab,    setActiveTab]    = useState('terminal');
 
   // ── New analytics state ──
   const [balanceHistory,   setBalanceHistory]   = useState(() => { try { return JSON.parse(localStorage.getItem('bd_balHist')||'[]'); } catch{ return []; } });
@@ -218,47 +241,16 @@ export default function App() {
         }).catch(() => setEnriching(false));
       }
     } else {
-      setPolyStatus('⚠️ CORS blocked — use 📊 Smart Fill or enter odds manually');
+      setPolyStatus('⚠️ Polymarket unavailable — backend proxy or market not found. Enter odds manually or wait for Auto.');
     }
   }, []);
 
-  // ─── SMART FILL — estimate odds from chart signals ────────────────────────
-  const smartFill = useCallback(() => {
-    if (!price || Object.keys(tfData).length === 0) {
-      setPolyStatus('⚠️ Fetch chart data first, then Smart Fill'); return;
-    }
-    const d5m = tfData['5m'], d1m = tfData['1m'], d4h = tfData['4h'], d1h = tfData['1h'], d15m = tfData['15m'];
-    if (!d5m || !d1m || !d4h) return;
-
-    // Weight 4H 3x, 1H 2x, others 1x — so 4H strongly influences direction
-    const weightedSignals = [
-      { val: d4h.macd.bullish, w: 3 },   // 4H MACD — most important
-      { val: d4h.rsi > 50, w: 2 },       // 4H RSI
-      { val: d1h?.macd.bullish, w: 2 },  // 1H MACD
-      { val: d15m?.macd.bullish, w: 1 }, // 15m MACD
-      { val: d5m.macd.bullish, w: 1 },   // 5m MACD
-      { val: d1m.macd.bullish, w: 1 },   // 1m MACD
-      { val: (d5m.stochRSI?.k || 50) > 50, w: 1 }, // StochRSI
-    ].filter(s => s.val !== undefined && s.val !== null);
-
-    const totalWeight = weightedSignals.reduce((a, s) => a + s.w, 0);
-    const bullWeight  = weightedSignals.filter(s => s.val).reduce((a, s) => a + s.w, 0);
-    const bullPct     = Math.round((bullWeight / totalWeight) * 100);
-
-    // Small noise ±4% to simulate market spread
-    const noise  = Math.round((Math.random() - 0.5) * 8);
-    const upEst  = Math.max(30, Math.min(72, bullPct + noise));
-    const dnEst  = 100 - upEst;
-
-    setUpOdds(upEst.toString());
-    setDnOdds(dnEst.toString());
-    if (!threshold) { setThreshold(Math.round(price).toString()); }
-    setThresholdSource('smartfill'); // Smart Fill = estimated, not real Polymarket threshold
-
-    // Tell user which way 4H is pointing
-    const macro4H = d4h.macd.bullish ? '4H BULLISH' : '4H BEARISH';
-    setPolyStatus(`📊 Smart Fill: ${upEst}¢ UP / ${dnEst}¢ DOWN (${macro4H} weighted)`);
-  }, [tfData, price, threshold]);
+  // ─── POLYMARKET AUTO REFRESH ──────────────────────────────────────────────
+  useEffect(() => {
+    fetchPoly();
+    const t = setInterval(fetchPoly, 30000);
+    return () => clearInterval(t);
+  }, [fetchPoly]);
 
   // ─── WHALE FETCH ─────────────────────────────────────────────────────────
   const fetchWhales = useCallback(async () => {
@@ -325,6 +317,42 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem('bd_aiLog',      JSON.stringify(aiLog));       } catch{} }, [aiLog]);
   useEffect(() => { try { localStorage.setItem('bd_pendingBet', JSON.stringify(pendingBet));  } catch{} }, [pendingBet]);
   useEffect(() => { try { localStorage.setItem('bd_balHist',    JSON.stringify(balanceHistory.slice(-200))); } catch{} }, [balanceHistory]);
+
+  // Load AI state from backend if available
+  useEffect(() => {
+    fetchAiState().then((state) => {
+      if (!state?.payload) { aiStateLoaded.current = true; return; }
+      const p = state.payload || {};
+      if (p.weights) setWeights(p.weights);
+      if (p.aiLog) setAiLog(p.aiLog);
+      if (p.betHistory) setBetHistory(p.betHistory);
+      if (p.paperBets) setPaperBets(p.paperBets);
+      if (p.balance !== undefined) setBalance(p.balance);
+      if (p.botCfg) setBotCfg(p.botCfg);
+      if (p.balanceHistory) setBalanceHistory(p.balanceHistory);
+      if (p.signalAccuracy) setSignalAccuracy(p.signalAccuracy);
+      if (p.weightHistory) setWeightHistory(p.weightHistory);
+      aiStateLoaded.current = true;
+    }).catch(() => { aiStateLoaded.current = true; });
+  }, []);
+
+  // Persist AI state to backend (debounced)
+  useEffect(() => {
+    if (!aiStateLoaded.current) return;
+    const payload = {
+      weights,
+      aiLog,
+      betHistory,
+      paperBets,
+      balance,
+      botCfg,
+      balanceHistory,
+      signalAccuracy,
+      weightHistory,
+    };
+    const t = setTimeout(() => { saveAiState(payload); }, 2000);
+    return () => clearTimeout(t);
+  }, [weights, aiLog, betHistory, paperBets, balance, botCfg, balanceHistory, signalAccuracy, weightHistory]);
   useEffect(() => { try { localStorage.setItem('bd_sigAcc',     JSON.stringify(signalAccuracy)); } catch{} }, [signalAccuracy]);
   useEffect(() => { try { localStorage.setItem('bd_wHist',      JSON.stringify(weightHistory.slice(-20))); } catch{} }, [weightHistory]);
 
@@ -794,19 +822,6 @@ export default function App() {
     return () => { clearInterval(tick); setBotStatus('idle'); autoRef.current.lastStopTime = Date.now(); };
   }, [autoBot, botPlaceBet, botResolveBet, fetchData]);
 
-  // ─── AUTO-FILL ODDS WHEN DATA LOADS ────────────────────────────────────
-  // Automatically SmartFill odds whenever fresh chart data arrives.
-  // Only runs when odds are empty OR when they were set by SmartFill (not manual/real Polymarket).
-  // This way: fresh Fetch → instant signal without any manual button click.
-  useEffect(() => {
-    if (Object.keys(tfData).length > 0 && price) {
-      // Auto-fill if: odds are empty, OR previous fill was also from SmartFill (keep fresh)
-      if (!upOdds || !dnOdds || thresholdSource === 'smartfill') {
-        smartFill();
-      }
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tfData]);
   const placeBet = () => {
     if (!pred || !['UP','DOWN'].includes(pred.result)) return;
     const amt = parseFloat(betAmt) || 5;
@@ -864,76 +879,75 @@ export default function App() {
       <style>{CSS}</style>
 
       {/* ── HEADER ── */}
-      <header style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 12px', borderBottom:'1px solid #0d0d26', flexShrink:0, background:'#07071a', gap:8, flexWrap:'wrap' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:8 }}>
-          <div className="paw" style={{ fontSize:24, filter:'drop-shadow(0 0 8px rgba(255,109,0,.8))' }}>🐾</div>
+      <header style={{ display:'flex', flexWrap:'wrap', alignItems:'center', justifyContent:'space-between', gap:12, padding:'12px 16px', borderBottom:'1px solid rgba(255,255,255,.06)', flexShrink:0 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div className="paw" style={{ width:38, height:38, borderRadius:'50%', background:'linear-gradient(135deg,#f2994a,#38d4b3)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:18, fontWeight:800 }}>🐾</div>
           <div>
-            <div style={{ fontFamily:"'Fredoka One'", fontSize:16, color:'#ff6d00', lineHeight:1 }}>BabyDoge BTC Oracle <span style={{ fontSize:10, color:'#303060' }}>v3</span></div>
-            <div style={{ fontSize:8, color:'#1a1a40' }}>such intelligence • very terminal • much signal • wow</div>
+            <div style={{ fontFamily:"'Sora'", fontSize:16, fontWeight:700, lineHeight:1 }}>
+              <span style={{ background:'linear-gradient(90deg,#f2994a,#38d4b3)', WebkitBackgroundClip:'text', color:'transparent' }}>BabyDoge BTC Oracle</span>
+              <span style={{ fontSize:10, color:'#5b6072', marginLeft:6 }}>v4</span>
+            </div>
+            <div style={{ fontSize:9, color:'#5b6072', letterSpacing:1 }}>Bayesian • microstructure • execution lab</div>
           </div>
         </div>
 
         {/* Tabs */}
-        <nav style={{ display:'flex', gap:2, background:'#050510', padding:3, borderRadius:8 }}>
-          {[['dashboard','🐾 Dashboard'],['chart','📊 Chart'],['autobot','🤖 Auto-Bot'],['whales','🐋 Whales'],['ai','🧠 AI Lab'],['rules','📋 Rules'],['schedule','⏰ Schedule']].map(([id,l])=>(
-            <button key={id} className="tab" onClick={()=>setActiveTab(id)}
-              style={{ color:activeTab===id?'#ff6d00':'#2a2a5a', background:activeTab===id?'#0f0f2a':'transparent' }}>{l}</button>
+        <nav className="glass-panel" style={{ display:'flex', gap:12, padding:'8px 16px', alignItems:'center' }}>
+          {[['terminal','TERMINAL'],['lab','AI LAB & RULES']].map(([id,l])=>(
+            <button key={id} className={`nav-btn ${activeTab===id?'active':''}`} onClick={()=>setActiveTab(id)}>
+              {l}
+            </button>
           ))}
         </nav>
 
         {/* Price + WS status + Fetch */}
-        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-          {/* Market classification */}
+        <div style={{ display:'flex', alignItems:'center', gap:14 }}>
           {market && market.label !== 'LOADING' && (
-            <div style={{ padding:'3px 10px', borderRadius:12, background:market.label==='BULLISH'?'rgba(0,229,170,.08)':market.label==='BEARISH'?'rgba(255,51,102,.08)':'rgba(255,213,0,.08)', fontFamily:"'Fredoka One'", fontSize:10, color:market.label==='BULLISH'?'#00e5aa':market.label==='BEARISH'?'#ff3366':'#ffd700' }}>
-              {market.label==='BULLISH'?'🐂':market.label==='BEARISH'?'🐻':'⚠️'} {market.label}
+            <div style={{ padding:'4px 10px', borderRadius:12, background:market.label==='BULLISH'?'rgba(0,255,148,.12)':market.label==='BEARISH'?'rgba(255,75,43,.12)':'rgba(242,153,74,.12)', fontSize:10, color:market.label==='BULLISH'?'#00ff94':market.label==='BEARISH'?'#ff4b2b':'#f2994a', fontWeight:700 }}>
+              {market.label}
             </div>
           )}
           {price && (
             <div style={{ textAlign:'right' }}>
-              <div style={{ fontFamily:"'Fredoka One'", fontSize:18, color:priceDir==='up'?'#00e5aa':priceDir==='down'?'#ff3366':'#e0e0ff', lineHeight:1, transition:'color .3s' }}>${fmt(price)}</div>
-              <div style={{ fontSize:9, color:change24h>=0?'#00e5aa':'#ff3366', fontWeight:800 }}>{change24h>=0?'▲':'▼'} {Math.abs(change24h)}%</div>
+              <div style={{ fontFamily:"'Sora'", fontSize:18, fontWeight:700, color:priceDir==='up'?'#00ff94':priceDir==='down'?'#ff4b2b':'#e8e8f2', lineHeight:1 }}>${fmt(price)}</div>
+              <div style={{ fontSize:9, color:change24h>=0?'#00ff94':'#ff4b2b', fontWeight:700 }}>{change24h>=0?'▲':'▼'} {Math.abs(change24h)}%</div>
             </div>
           )}
-          <div style={{ display:'flex', alignItems:'center', gap:5 }}>
-            <div style={{ width:7, height:7, borderRadius:'50%', background:wsLive?'#00e5aa':'#ff3366', ...(wsLive?{animation:'flash 1s infinite'}:{}) }} title={wsLive?'Live WS':'Polling'} />
-            <span style={{ fontSize:8, color:'#2a2a5a' }}>{wsLive?'LIVE':'POLL'}</span>
+          <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+            <div className={wsLive?'live-dot':'dead-dot'} title={wsLive?'Live WS':'Polling'} />
+            <span style={{ fontSize:8, color:'#5b6072' }}>{wsLive?'LIVE':'POLL'}</span>
           </div>
           <div>
             <button className="btn" onClick={fetchData} disabled={loading}
-              style={{ background:'linear-gradient(135deg,#ff6d00,#ff9d00)', color:'white', fontSize:11, padding:'7px 12px' }}>
+              style={{ background:'linear-gradient(135deg,#f2994a,#ff7a00)', color:'#0a0b10', fontSize:11, padding:'8px 14px' }}>
               {loading?<span className="spin">🐾</span>:'↻'} {loading?'Fetching...':'Fetch Data'}
             </button>
-            <div style={{ fontSize:8, color:'#1a1a40', marginTop:2, textAlign:'right' }}>
-              {apiErrors.length>0 ? <span style={{color:'#ff3366'}}>⚠ {apiErrors.join(', ')} failed</span> : lastUpdate ? `✓ ${lastUpdate} • ${refreshIn}s` : 'Click to load'}
+            <div style={{ fontSize:8, color:'#5b6072', marginTop:3, textAlign:'right' }}>
+              {apiErrors.length>0 ? <span style={{color:'#ff4b2b'}}>⚠ {apiErrors.join(', ')} failed</span> : lastUpdate ? `✓ ${lastUpdate} • ${refreshIn}s` : 'Click to load'}
             </div>
           </div>
         </div>
       </header>
 
+      <main className="scroll" style={{ flex:1, overflow:'auto' }}>
+
       {/* ══════════════════════════════════════════════════════
-          DASHBOARD TAB
+          TERMINAL PAGE
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='dashboard' && (
-        <div style={{ flex:1, display:'grid', gridTemplateColumns:'205px 1fr 235px', gap:8, padding:8, overflow:'hidden', minHeight:0 }}>
+      {activeTab==='terminal' && (
+        <div className="dash-grid" style={{ flex:1 }}>
 
           {/* ── LEFT: Polymarket + Paper Bet ── */}
-          <div className="scroll" style={{ display:'flex', flexDirection:'column', gap:7 }}>
+          <section className="dash-col scroll" style={{ gridColumn:'span 4', display:'flex', flexDirection:'column', gap:14 }}>
 
             {/* Polymarket Panel */}
             <div className="card" style={{ padding:11 }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
                 <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:13 }}>🎯 Polymarket Odds</div>
                 <div style={{ display:'flex', gap:4 }}>
-                  <button className="btn" onClick={smartFill}
-                    disabled={Object.keys(tfData).length===0}
-                    style={{ background:Object.keys(tfData).length>0?'linear-gradient(135deg,#ff6d00,#ff9d00)':'#0c0c22', color:Object.keys(tfData).length>0?'white':'#252550', border:'none', fontSize:9, padding:'4px 9px' }}
-                    title="Estimate odds from your live chart signals">
-                    📊 Smart Fill
-                  </button>
                   <button className="btn" onClick={fetchPoly}
-                    style={{ background:'#0c0c22', color:'#3a3a6a', border:'1px solid #1a1a38', fontSize:9, padding:'4px 7px' }}
-                    title="Tries Polymarket API — usually blocked by CORS in browser">
+                    style={{ background:'linear-gradient(135deg,#ff6d00,#ff9d00)', color:'white', border:'none', fontSize:9, padding:'4px 10px' }}
+                    title="Pulls Polymarket odds via backend proxy">
                     ⚡ Auto
                   </button>
                 </div>
@@ -944,8 +958,8 @@ export default function App() {
                 <div style={{ fontSize:9, color:polyStatus.includes('✅')||polyStatus.includes('📊')?'#00e5aa':polyStatus.includes('⚠')?'#ff9d00':'#ffd700', marginBottom:7, fontWeight:700, padding:'4px 7px', background:'rgba(255,255,255,.03)', borderRadius:5 }}>{polyStatus}</div>
               ) : (
                 <div style={{ fontSize:9, color:'#303060', marginBottom:7, lineHeight:1.6, padding:'5px 7px', background:'#050510', borderRadius:6, border:'1px solid #0f0f28' }}>
-                  <span style={{color:'#00e5aa',fontWeight:800}}>⚡ Auto-filling</span> odds from chart signals on each fetch<br/>
-                  <span style={{color:'#303060'}}>Or enter manually below. ⚡ Auto tries real Polymarket too.</span>
+                  <span style={{color:'#00e5aa',fontWeight:800}}>⚡ Auto</span> pulls Polymarket odds via backend proxy<br/>
+                  <span style={{color:'#303060'}}>If unavailable, enter odds manually below.</span>
                 </div>
               )}
 
@@ -1019,10 +1033,10 @@ export default function App() {
               {threshold && (
                 <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:4 }}>
                   <div style={{ fontSize:7, fontWeight:800, padding:'2px 8px', borderRadius:10,
-                    background: thresholdSource==='real'?'rgba(0,229,170,.1)':thresholdSource==='smartfill'?'rgba(255,109,0,.1)':'rgba(255,255,255,.04)',
-                    color: thresholdSource==='real'?'#00e5aa':thresholdSource==='smartfill'?'#ff9d00':'#3a3a6a',
-                    border: `1px solid ${thresholdSource==='real'?'#00e5aa33':thresholdSource==='smartfill'?'#ff9d0033':'#1a1a38'}` }}>
-                    {thresholdSource==='real'?'✅ Real Polymarket threshold':thresholdSource==='smartfill'?'📊 Smart Fill estimate — buffer skip disabled':'✏️ Manual entry'}
+                    background: thresholdSource==='real'?'rgba(0,229,170,.1)':'rgba(255,255,255,.04)',
+                    color: thresholdSource==='real'?'#00e5aa':'#3a3a6a',
+                    border: `1px solid ${thresholdSource==='real'?'#00e5aa33':'#1a1a38'}` }}>
+                    {thresholdSource==='real'?'✅ Real Polymarket threshold':'✏️ Manual entry'}
                   </div>
                 </div>
               )}
@@ -1095,10 +1109,10 @@ export default function App() {
                 </div>
               )}
             </div>
-          </div>
+          </section>
 
           {/* ── CENTER: TF Grid + Quick Chart ── */}
-          <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden', minHeight:0 }}>
+          <section className="dash-col" style={{ gridColumn:'span 5', display:'flex', flexDirection:'column', gap:14, overflow:'hidden', minHeight:0 }}>
             <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0 }}>
               <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:13 }}>📊 Multi-Timeframe Analysis</div>
               {apiErrors.length>0 && <div style={{ fontSize:9, color:'#ff3366', fontWeight:700 }}>⚠ Failed: {apiErrors.join(', ')}</div>}
@@ -1214,10 +1228,10 @@ export default function App() {
                 })()}
               </div>
             )}
-          </div>
+          </section>
 
           {/* ── RIGHT: Scorecard + Prediction + AI Pred + Skip ── */}
-          <div className="scroll" style={{ display:'flex', flexDirection:'column', gap:7 }}>
+          <section className="dash-col scroll" style={{ gridColumn:'span 3', display:'flex', flexDirection:'column', gap:14 }}>
 
             {/* Confluence Scorecard */}
             <div className="card" style={{ padding:11 }}>
@@ -1246,14 +1260,20 @@ export default function App() {
               ) : (
                 <div style={{ textAlign:'center', padding:'10px 6px' }}>
                   <div style={{ fontSize:20, marginBottom:5 }}>🐾</div>
-                  <div style={{ fontSize:10, color:'#252550', marginBottom:8, lineHeight:1.6 }}>
-                    Need Polymarket odds to score<br/>
-                    <span style={{ color:'#ff9d00' }}>→ Click 📊 Fill above (easiest!)</span>
-                  </div>
-                  {Object.keys(tfData).length > 0 && (
-                    <button className="btn" onClick={smartFill} style={{ background:'rgba(255,109,0,.15)', color:'#ff9d00', border:'1px solid #ff9d0044', fontSize:10, padding:'5px 12px', width:'100%' }}>
-                      📊 Smart Fill Odds Now
-                    </button>
+                  {pred?.result && pred.result !== '---' ? (
+                    <>
+                      <div style={{ fontSize:10, color:'#252550', marginBottom:6, lineHeight:1.5 }}>
+                        Confluence not scored this round
+                      </div>
+                      <div style={{ fontSize:10, color:'#ff9d00', fontWeight:700, lineHeight:1.6 }}>
+                        {pred.reason}
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize:10, color:'#252550', marginBottom:8, lineHeight:1.6 }}>
+                      Need Polymarket odds to score<br/>
+                      <span style={{ color:'#ff9d00' }}>→ Auto fetch or enter manually above</span>
+                    </div>
                   )}
                 </div>
               )}
@@ -1279,7 +1299,7 @@ export default function App() {
                   <div style={{ fontSize:20, marginBottom:5 }}>🔮</div>
                   <div style={{ fontSize:10, color:'#252550', lineHeight:1.7 }}>
                     Step 1: Click <span style={{color:'#ff9d00',fontWeight:800}}>Fetch Data</span><br/>
-                    Step 2: Click <span style={{color:'#ff9d00',fontWeight:800}}>📊 Fill</span> for odds<br/>
+                    Step 2: <span style={{color:'#ff9d00',fontWeight:800}}>⚡ Auto</span> pulls odds (or enter manually)<br/>
                     Step 3: Prediction appears here
                   </div>
                 </div>
@@ -1329,14 +1349,14 @@ export default function App() {
               liquidityUSDC={polyRound?.volume || 100000}
               balance={balance}
             />
-          </div>
+          </section>
         </div>
       )}
 
       {/* ══════════════════════════════════════════════════════
           CHART TAB — Full Candlestick
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='chart' && (
+      {activeTab==='terminal' && (
         <div style={{ flex:1, padding:10, display:'flex', flexDirection:'column', gap:8, overflow:'hidden', minHeight:0 }}>
           <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0 }}>
             <div style={{ fontFamily:"'Fredoka One'", color:'#ff6d00', fontSize:14 }}>📊 BTC Candlestick Chart</div>
@@ -1408,7 +1428,7 @@ export default function App() {
       {/* ══════════════════════════════════════════════════════
           AUTO-BOT TAB
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='autobot' && (
+      {activeTab==='terminal' && (
         <div style={{ flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minHeight:0 }}>
           <div style={{ flex:1, padding:10, display:'grid', gridTemplateColumns:'280px 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
 
@@ -1689,7 +1709,7 @@ export default function App() {
       {/* ══════════════════════════════════════════════════════
           WHALES TAB
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='whales' && (
+      {activeTab==='terminal' && (
         <div style={{ flex:1, padding:10, display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, overflow:'hidden', minHeight:0 }}>
           {/* Whale sentiment */}
           <div style={{ display:'flex', flexDirection:'column', gap:7, overflow:'hidden' }}>
@@ -1762,7 +1782,7 @@ export default function App() {
       {/* ══════════════════════════════════════════════════════
           AI LAB TAB
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='ai' && (
+      {activeTab==='lab' && (
         <div style={{ flex:1, padding:8, display:'flex', flexDirection:'column', gap:7, overflow:'hidden', minHeight:0 }}>
 
           {/* ── ROW 1: Stats bar ── */}
@@ -2175,13 +2195,45 @@ export default function App() {
       {/* ══════════════════════════════════════════════════════
           RULES TAB
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='rules' && (
+      {activeTab==='lab' && (
         <div style={{ flex:1, padding:8, display:'grid', gridTemplateColumns:'repeat(2,1fr)', gap:8, overflow:'auto' }}>
           {[
-            { title:'🚫 Instant NO BET', color:'#ff3366', items:['🔴 Dangerous flag active','🐋 Whale Dominated any %','💧 Low Liquidity <85K','⚖️ Market odds 48–52¢ (coin flip)','📍 Price within $20 of threshold','⚠️ 4H NEUTRAL + mixed signals','🚨 StochRSI exact 0 or 100'] },
-            { title:'✅ Winning Pattern', color:'#00e5aa', items:['Odds 60¢+ favoring one side','Price $30+ buffer on winning side','4H macro agrees with direction','No Dangerous/Whale/Low Liq flags','Score 4–5/5 with aligned AI pred'] },
-            { title:'📉 Losing Patterns', color:'#ff9d00', items:['Fighting 4H bullish with DOWN bets','Ignoring StochRSI extremes','Betting within $20 of threshold','Betting 50/50 odds','Sending screenshots during round','Ignoring whale sentiment'] },
-            { title:'🐋 Whale Rules', color:'#c44dff', items:['Exchange deposits = selling signal = bearish','Exchange withdrawals = bullish signal','±$200 BTC moves = liquidation cascade','Whale Dominated 2000%+ = skip always','Check whale tab BEFORE betting','Demo mode active — add API key for live data'] },
+            { title:'⚡ Scalp Entry Gate', color:'#00e5aa', items:[
+              'Signal score ≥ minScore (default 3/5)',
+              'Confidence ≥ minConf (default 55%)',
+              'Odds sweet spot 53–62¢ (edge zone)',
+              'Price buffer ≥ $10 from threshold (hard skip inside $10)',
+              '4H macro + multi‑TF vote aligned with direction',
+              'Auto‑Bot evaluates ~80–90s before round end'
+            ]},
+            { title:'🚫 Instant NO BET', color:'#ff3366', items:[
+              'Dangerous / Whale Dom / Low Liquidity < $85k',
+              'Coin flip odds 48–52¢',
+              'Price within $10 of threshold',
+              'StochRSI extreme ≤1 or ≥99',
+              '4H NEUTRAL + split TF vote',
+              'Anti‑macro bets when odds >62¢'
+            ]},
+            { title:'🧠 Quant Engine Overrides', color:'#c44dff', items:[
+              'After 4+ rule skips, Bayes + LMSR can override',
+              'Override only if Bayes + LMSR agree on direction',
+              'Bayesian veto can cancel a rule‑based bet',
+              'LMSR edge quality adjusts size'
+            ]},
+            { title:'🐋 Whale & Liquidity', color:'#38d4b3', items:[
+              'Whale sentiment boosts confidence when aligned',
+              'Manual Whale flag = hard skip',
+              'Exchange deposits = bearish pressure',
+              'Exchange withdrawals = bullish pressure',
+              'Demo mode if no Whale API key'
+            ]},
+            { title:'🛡 Risk & Circuit Breakers', color:'#f2994a', items:[
+              'Session stop‑loss (default $20)',
+              'Session profit target (default $30)',
+              'Consecutive loss breaker pauses 1 round',
+              'Kelly sizing optional; conservative pre‑calibration',
+              'No bet if balance < bet amount'
+            ]},
           ].map((sec,i)=>(
             <div key={i} className="card" style={{ padding:13, borderLeft:`3px solid ${sec.color}` }}>
               <div style={{ fontFamily:"'Fredoka One'", color:sec.color, fontSize:13, marginBottom:9 }}>{sec.title}</div>
@@ -2196,7 +2248,7 @@ export default function App() {
       {/* ══════════════════════════════════════════════════════
           SCHEDULE TAB
       ══════════════════════════════════════════════════════ */}
-      {activeTab==='schedule' && (
+      {activeTab==='lab' && (
         <div style={{ flex:1, padding:8, display:'grid', gridTemplateColumns:'repeat(2,1fr)', gap:8, overflow:'auto' }}>
           {[
             { title:'🟢 Best Windows (EST)', color:'#00e5aa', rows:[['3:00–5:00 AM','London Open','Good liquidity'],['8:00–12:00 PM','London/NY Overlap','⭐ BEST WINDOW'],['12:00–2:00 PM','NY Session','Watch for flags']] },
@@ -2220,6 +2272,7 @@ export default function App() {
         </div>
       )}
 
+      </main>
       <footer style={{ textAlign:'center', fontSize:8, color:'#0f0f28', borderTop:'1px solid #0c0c22', padding:'3px', flexShrink:0 }}>
         🐾 BabyDoge BTC Oracle v3 • Binance WebSocket + REST • Polymarket Gamma API • NOT financial advice • wow
       </footer>

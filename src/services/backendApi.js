@@ -40,3 +40,29 @@ export async function fetchTrades(limit = 50) {
     return [];
   }
 }
+
+export async function fetchAiState() {
+  try {
+    const res = await fetch(`${API_BASE}/ai/state`);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.warn('[BackendAPI] ai state error:', e.message);
+    return null;
+  }
+}
+
+export async function saveAiState(payload) {
+  try {
+    const res = await fetch(`${API_BASE}/ai/state`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ payload }),
+    });
+    if (!res.ok) throw new Error(`ai save failed: ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.warn('[BackendAPI] ai save error:', e.message);
+    return null;
+  }
+}

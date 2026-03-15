@@ -2,7 +2,6 @@
 // Uses Whale Alert API (free tier) + fallback demo data
 // Get a free API key at https://whale-alert.io/
 
-const WHALE_API_KEY = 'YOUR_WHALE_ALERT_API_KEY'; // Replace with real key
 const MIN_VALUE_USD = 5_000_000; // $5M+ transfers
 const API_BASE = import.meta.env?.VITE_API_BASE || 'http://127.0.0.1:8000';
 
@@ -14,11 +13,6 @@ export async function fetchWhaleTransactions() {
   const start = Math.floor(Date.now() / 1000) - 3600; // Last 1 hour
 
   try {
-    if (WHALE_API_KEY === 'YOUR_WHALE_ALERT_API_KEY') {
-      // Demo mode — generate realistic simulated whale data
-      return generateDemoWhales();
-    }
-
     const res = await fetch(`${API_BASE}/whale/transactions?min_value=${MIN_VALUE_USD}&start=${start}&currency=btc&limit=20`);
     if (!res.ok) throw new Error(`Whale API ${res.status}`);
     const data = await res.json();

@@ -82,7 +82,7 @@ export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresh
   const threshV = parseFloat(threshold) || 0;
   const cur     = price || 0;
 
-  if (!upV && !dnV) return pending('Enter Polymarket odds — click 📊 Smart Fill or type manually.');
+  if (!upV && !dnV) return pending('Enter Polymarket odds — click ⚡ Auto or type manually.');
   if (upV >= 48 && upV <= 52) return nobet('⚖️ Coin flip 48–52¢ — no edge.', '#ffd700', []);
 
   // Odds ceiling: if favored side is >62¢, market is too confident — we can't beat it.
@@ -99,15 +99,10 @@ export function buildSignal({ tfData, price, upOdds, downOdds, threshold, thresh
     return nb;
   }
 
-  // Buffer skip — behaviour depends on threshold source:
-  // 'real'      = from Polymarket API → hard skip <$10 (real money threshold matters)
-  // 'smartfill' = estimated from chart → only warn, never hard skip (it's just an estimate)
-  // unknown     = hard skip <$10 to be safe
+  // Buffer skip — hard skip <$10 to avoid coin-flip thresholds
   const bufAbs = threshV > 0 ? Math.abs(cur - threshV) : null;
-  if (bufAbs !== null && thresholdSource !== 'smartfill') {
-    if (bufAbs < 10)
-      return nobet(`⚠️ Price only $${bufAbs.toFixed(0)} from threshold — too close, skip.`, '#ffd700', []);
-  }
+  if (bufAbs !== null && bufAbs < 10)
+    return nobet(`⚠️ Price only $${bufAbs.toFixed(0)} from threshold — too close, skip.`, '#ffd700', []);
 
   const d4h = tfData?.['4h'], d1h = tfData?.['1h'], d5m = tfData?.['5m'], d1m = tfData?.['1m'];
   if (!d4h || !d5m || !d1m) return pending('Chart data loading — click Fetch Data.');
