@@ -8,7 +8,7 @@ def _get_env(name: str, default: str) -> str:
 
 DATABASE_URL = _get_env(
     "DATABASE_URL",
-    "postgresql+psycopg2://postgres:postgres@localhost:5432/crypto_oracle",
+    "postgresql+psycopg2://postgres:759486@localhost:5432/crypto_oracle",
 )
 
 BINANCE_SYMBOL = _get_env("BINANCE_SYMBOL", "BTCUSDT")
